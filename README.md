@@ -59,7 +59,6 @@ variables.
 | Table 3: GPT-2 single token, 64 input tokens | `oneshot_gpt2` / `gpt2` | `SEQ_LEN=64` (`PROMPT_LEN=64` for `oneshot_gpt2`) |
 | Table 4: nanoGPT (EZKL config), 1 token | `nanogpt` | `SEQ_LEN=1` |
 | Table 5: LLaMA2-7B single token | `oneshot_llama` / `llama` | `NUM_LAYERS=32` (`VOCAB_SIZE=32000` for `oneshot_llama`) |
-| Table 6 (StructuredExp vs. non-structured exp) | `structured_exp`, `nonstructured_exp` | none |
 | Table 1: perplexity before/after quantization | `ppl_repro/` | see [ppl_repro/README.md](ppl_repro/README.md) |
 
 Example:
