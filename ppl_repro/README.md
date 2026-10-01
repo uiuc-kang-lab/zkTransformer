@@ -1,7 +1,6 @@
 # PPL reproduction scripts
 
-FP32 and Q15 perplexity scripts for GPT-2 and LLaMA-2 on WikiText-2 and C4,
-copied from `/scratch/bjchen4_icgpu/ppl/`.
+FP32 and Q15 perplexity scripts for GPT-2 and LLaMA-2 on WikiText-2 and C4.
 
 GPT-2 scripts run on WikiText-2 only. LLaMA scripts support
 `--dataset {wikitext,c4}`: WikiText-2 uses the `wikitext-2-raw-v1`
