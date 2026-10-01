@@ -1,141 +1,98 @@
-# zktransformer
+# zkTransformer
 
-A zero-knowledge proof system for verifiable inference of transformer models. Generate succinct proofs that a neural network inference was computed correctly without revealing the model weights or inputs.
+Artifact for the paper *zkTransformer: Scalable Zero-Knowledge Proofs for LLM
+Inference via Einsum Arithmetization and Structured Exponentiation Lookups*
+([zkTransformer.pdf](zkTransformer.pdf)).
 
-## Features
+zkTransformer proves transformer inference end-to-end, from input token IDs
+to output token IDs. It combines **EinSumcheck**, which compiles Einsum-expressible
+linear ops into a single Sumcheck, with **StructuredExp**, which handles
+exponentiation lookups without committing to the table. The polynomial
+commitment scheme is KZH-3 over BN254.
 
-- **Supported Models**: GPT-2, GPT-J-6B, BERT-Large, LLaMA-2-7B
-- **Polynomial Commitments**: KZH2 and KZH3 schemes with sparse polynomial support
-- **Sumcheck Protocol**: Linear and sparse-dense sumcheck provers for efficient verification
-- **Multiple Backends**:
-  - [arkworks](https://github.com/arkworks-rs) - Pure Rust implementation
-  - [icicle](https://github.com/ingonyama-zk/icicle) - GPU-accelerated operations
-- **Curve Support**: BN254, BLS12-381, Goldilocks
-
-## Architecture
+## Layout
 
 ```
 src/
-├── basicblock/     # Neural network layer implementations (Add, Einsum, Permute, etc.)
-├── crypto/
-│   ├── polycommit/ # KZH2/KZH3 polynomial commitment schemes
-│   └── sumcheck/   # Sumcheck protocol (prover & verifier)
-├── dag/            # Computation graph builder for transformer architectures
-└── util/           # Polynomials, transcripts, serialization
+├── basicblock/     # Building blocks (Einsum, Add, Exp, Range, Permute, ...)
+├── crypto/         # KZH-3 polynomial commitments, Sumcheck prover/verifier
+├── dag/            # Circuit builder and model definitions (GPT-2, LLaMA, nanoGPT)
+├── util/
+└── bin/            # Proving binaries used in the paper (see below)
+ppl_repro/          # Perplexity scripts for Table 1
+parse_timing.py     # Sums commit times from a proving log
+parse_prove_timing.py  # Per-operation prove times from a proving log (Table 7)
 ```
 
-## Quick Start
+## Build
 
-### Prerequisites
-
-- Rust 1.70+
-- For GPU acceleration: CUDA toolkit (optional, for icicle backend)
-
-### Build
+The paper runs used Rust `nightly-2025-07-01` with the default features
+(BN254, arkworks backend) on a 32-core Intel Xeon Platinum 8358 server with
+2 TB of memory.
 
 ```bash
-# Default build (BN254 curve, arkworks backend)
-cargo build --release
-
-# With icicle GPU acceleration
-cargo build --release --features icicle
+cargo +nightly-2025-07-01 build --release
 ```
 
-### Run
+Each binary checks for `<size>.srs` files in the working directory. Any that
+are missing are generated and cached there on first use. To pre-generate one
+SRS by hand:
 
 ```bash
-# Run with default settings (BN254)
-cargo run --release -- config.yaml
-
-# Run with BLS12-381 curve
-cargo run --release --no-default-features --features bls12_381,arkworks -- config.yaml
-
-# Run with Goldilocks field
-cargo run --release --no-default-features --features goldilocks,icicle -- config.yaml
+cargo +nightly-2025-07-01 run --release --bin setup -- generate <log_size>
 ```
 
-### Run Specific Models
+Each run prints the commit, prove and verify times, the proof size, and
+whether verification passed. Use `RUST_LOG=debug` to get the per-node timing
+lines that the log parsers read.
+
+## Reproducing the paper
+
+All models use random weights with the real architecture shapes. Prover cost
+depends only on the shapes. Each binary is configured through environment
+variables.
+
+| Paper result | Binary | Settings |
+|---|---|---|
+| Table 2, Table 6 (full system), Table 7, Table 8: GPT-2, 16 prompt + 16 generated tokens | `oneshot_gpt2` | `SEQ_LEN=32 PROMPT_LEN=16 VOCAB_SIZE=50257` |
+| Figure 1: GPT-2 seq-length scaling | `oneshot_gpt2` | `SEQ_LEN∈{32,64,128,256,512,1024} PROMPT_LEN=16 VOCAB_SIZE=50257` |
+| Table 3: GPT-2 single token, 64 input tokens | `oneshot_gpt2` / `gpt2` | `SEQ_LEN=64` (`PROMPT_LEN=64` for `oneshot_gpt2`) |
+| Table 4: nanoGPT (EZKL config), 1 token | `nanogpt` | `SEQ_LEN=1` |
+| Table 5: LLaMA2-7B single token | `oneshot_llama` / `llama` | `NUM_LAYERS=32` (`VOCAB_SIZE=32000` for `oneshot_llama`) |
+| Table 6 (StructuredExp vs. non-structured exp) | `structured_exp`, `nonstructured_exp` | none |
+| Table 1: perplexity before/after quantization | `ppl_repro/` | see [ppl_repro/README.md](ppl_repro/README.md) |
+
+Example:
 
 ```bash
-# GPT-2
-cargo run --release --bin gpt2
-
-# GPT-2 with real weights
-cargo run --release --bin gpt2_real
-
-# BERT-Large
-cargo run --release --bin bert
-
-# GPT-J-6B
-cargo run --release --bin gptj
-
-# LLaMA-2-7B
-cargo run --release --bin llama
+SEQ_LEN=32 PROMPT_LEN=16 VOCAB_SIZE=50257 RUST_LOG=debug \
+  cargo +nightly-2025-07-01 run --release --bin oneshot_gpt2 2>&1 | tee gpt2_32.log
+python parse_prove_timing.py gpt2_32.log   # per-operation prove-time breakdown
+python parse_timing.py gpt2_32.log         # commit-time totals
 ```
 
-### Generate SRS
+### Binaries
 
-```bash
-# Generate Structured Reference String for polynomial size 2^20
-cargo run --release --bin setup -- generate 20
+- `oneshot_gpt2`: GPT-2 Small, full pipeline: token embedding, positional
+  encoding, 12 transformer blocks, LM head and argmax check. Env vars:
+  `SEQ_LEN`, `PROMPT_LEN` (default `SEQ_LEN/2`), `VOCAB_SIZE`, and
+  `SKIP_AUTOREGRESSIVE=1`, which uses random tokens and skips the AR
+  generation loop. Proving time does not change with it.
+- `oneshot_llama`: LLaMA2-7B, full pipeline with RoPE and a separate LM
+  head. Env vars: `SEQ_LEN`, `PROMPT_LEN`, `VOCAB_SIZE`, `NUM_LAYERS`,
+  `NUM_HEADS`, `HEAD_DIM`, `MLP_DIM`, `SKIP_AUTOREGRESSIVE`.
+- `gpt2`, `llama`: transformer blocks only, on a pre-embedded input.
+  Env vars: `SEQ_LEN`, `SEED`, and `NUM_LAYERS` for `llama`.
+- `nanogpt`: the nanoGPT model EZKL uses by default (4 layers, 4 heads,
+  n_embd=64). Env var: `SEQ_LEN`.
+- `structured_exp`, `nonstructured_exp`: exponentiation with and without
+  StructuredExp.
 
-# Load and verify existing SRS
-cargo run --release --bin setup -- load 20
-```
+### Baselines
 
-## Testing
-
-```bash
-# Run all tests
-cargo test
-
-# Run specific test
-cargo test test_kzh3
-
-# Run with logging
-RUST_LOG=debug cargo test
-```
-
-## Benchmarks
-
-```bash
-# Run sumcheck prover benchmark
-cargo bench --bench sumcheck_prover
-
-# Run permutation proof benchmark
-cargo bench --bench permute_prove
-
-# Run KZH opening benchmark
-cargo bench --bench kzh_openings_fast
-```
-
-## Configuration
-
-See `config.yaml` for configuration options:
-
-```yaml
-model: gpt2
-input_path: input.bin
-output_path: output.bin
-```
-
-## Feature Flags
-
-| Feature | Description |
-|---------|-------------|
-| `bn254` | Use BN254 curve (default) |
-| `bls12_381` | Use BLS12-381 curve |
-| `goldilocks` | Use Goldilocks field |
-| `arkworks` | Use arkworks backend (default) |
-| `icicle` | Use icicle GPU-accelerated backend |
-
-## Logging
-
-Control log verbosity with `RUST_LOG`:
-
-```bash
-RUST_LOG=debug cargo run --release -- config.yaml 2>&1 | tee output.log
-```
+- ZKML: https://github.com/uiuc-kang-lab/zkml.git
+- zkLLM: https://github.com/jvhs0706/zkllm-ccs2024.git
+- zkGPT: https://zenodo.org/records/16958213
 
 ## License
 

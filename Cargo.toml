@@ -63,10 +63,6 @@ harness = false
 name = "setup"
 path = "src/bin/setup.rs"
 
-[[bin]]
-name = "llama_einsum_bench"
-path = "src/bin/llama_einsum_bench.rs"
-
 [features]
 default = ["bn254", "arkworks"]
 bn254 = []
