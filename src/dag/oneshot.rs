@@ -104,6 +104,11 @@ impl<F: CryptoField + 'static> DagBuilder<F> {
     // 3. Broadcast subtract: diffs[i,j] = selected[i] - logits[i,j]
     let selected_broad = self.change_shape(selected, vec![seq_len, 1]);
     let diffs = self.sub(selected_broad, logits)[0];
+    let diffs = if seq_len != seq_len.next_power_of_two() || vocab_size != vocab_size.next_power_of_two() {
+      self.mask(diffs, vec![seq_len, vocab_size])
+    } else {
+      diffs
+    };
 
     // 4. Range check: all diffs >= 0 => selected[i] >= logits[i,j] for all j
     self.add_nonneg_node(diffs);

@@ -51,6 +51,7 @@ impl<F: CryptoField> BasicBlock<F> for Reducer {
       point: challenges.clone(),
       eval: x.data.as_ref().unwrap().evaluate_at_point(&challenges),
     };
+    transcript.append_scalar(b"reducer_out_eval", &claim_x.eval);
 
     proofs.push(sumcheck_proof);
     claims.push(claim_x);
@@ -58,16 +59,22 @@ impl<F: CryptoField> BasicBlock<F> for Reducer {
   }
 
   fn verify(&self, witnesses: &[&Witness<F>], claims: &[&Claim<F>], sumcheck_proofs: &[&SumcheckProof<F>], transcript: &mut Transcript<F>) -> bool {
-    assert!(witnesses.len() == 1, "Reducer expects 1 input");
+    if witnesses.len() != 1 || claims.len() < 3 || sumcheck_proofs.len() != 1 {
+      return false;
+    }
     let alpha: F = transcript.challenge_scalar(b"reducer_alpha");
     let alphas = calc_pow(alpha, claims.len() - 1);
     let x = witnesses[0];
+    let n_vars = get_n(&x.shape);
 
     let mut eval = <F as CryptoField>::zero();
     for (i, claim) in claims[..claims.len() - 1].iter().enumerate() {
+      if claim.point.len() != n_vars {
+        return false;
+      }
       eval = eval + claim.eval * alphas[i];
     }
-    let mut sumcheck_verifier = SumcheckVerifier::new(get_n(&x.shape), 2, transcript);
+    let mut sumcheck_verifier = SumcheckVerifier::new(n_vars, 2, transcript);
     let (verification_result, challenges) = sumcheck_verifier.verify(transcript, sumcheck_proofs[0].round_messages.clone(), eval);
     let running_sum = match verification_result {
       Some(v) => v,
@@ -88,13 +95,19 @@ impl<F: CryptoField> BasicBlock<F> for Reducer {
       eq_eval = eq_eval + alphas[i] * eq;
     }
 
-    // Final eval check: running_sum == x_eval * eq_eval
-    let x_eval = claims[claims.len() - 1].eval;
+    // Final eval & claim-point binding check: running_sum == x_eval * eq_eval and point == challenges
+    let reduced_claim = claims[claims.len() - 1];
+    if reduced_claim.point != challenges || reduced_claim.edge_id != claims[0].edge_id {
+      println!("verified reducer failed: reduced claim point/edge mismatch");
+      return false;
+    }
+    let x_eval = reduced_claim.eval;
     let expected = x_eval * eq_eval;
     if running_sum != expected {
       println!("verified reducer failed: final_eval check mismatch");
       return false;
     }
+    transcript.append_scalar(b"reducer_out_eval", &x_eval);
     true
   }
 }

@@ -36,11 +36,17 @@ impl<F: CryptoField> BasicBlock<F> for ChangeShape {
 
   fn verify(
     &self,
-    _witnesses: &[&Witness<F>],
-    _claims: &[&Claim<F>],
-    _sumcheck_proofs: &[&SumcheckProof<F>],
+    witnesses: &[&Witness<F>],
+    claims: &[&Claim<F>],
+    sumcheck_proofs: &[&SumcheckProof<F>],
     _transcript: &mut Transcript<F>,
   ) -> bool {
-    true
+    use crate::util::arith::get_n;
+    sumcheck_proofs.is_empty()
+      && witnesses.len() == 2
+      && get_n(&witnesses[0].shape) == get_n(&witnesses[1].shape)
+      && claims.len() == 2
+      && claims[0].point == claims[1].point
+      && claims[0].eval == claims[1].eval
   }
 }

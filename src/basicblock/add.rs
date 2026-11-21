@@ -99,8 +99,10 @@ impl<F: CryptoField> BasicBlock<F> for Add {
     (vec![], claims)
   }
 
-  fn verify(&self, witnesses: &[&Witness<F>], claims: &[&Claim<F>], _sumcheck_proofs: &[&SumcheckProof<F>], _transcript: &mut Transcript<F>) -> bool {
-    assert!(claims.len() == 3, "Add expects 3 claims"); // [a, b, c]
+  fn verify(&self, witnesses: &[&Witness<F>], claims: &[&Claim<F>], sumcheck_proofs: &[&SumcheckProof<F>], _transcript: &mut Transcript<F>) -> bool {
+    if claims.len() != 3 || witnesses.len() != 3 || !sumcheck_proofs.is_empty() {
+      return false;
+    }
     let mut verified = true;
     let c_point = &claims[2].point;
 
@@ -196,8 +198,10 @@ impl<F: CryptoField> BasicBlock<F> for Sub {
     (vec![], claims)
   }
 
-  fn verify(&self, witnesses: &[&Witness<F>], claims: &[&Claim<F>], _sumcheck_proofs: &[&SumcheckProof<F>], _transcript: &mut Transcript<F>) -> bool {
-    assert!(claims.len() == 3, "Sub expects 3 claims"); // [a, b, c]
+  fn verify(&self, witnesses: &[&Witness<F>], claims: &[&Claim<F>], sumcheck_proofs: &[&SumcheckProof<F>], _transcript: &mut Transcript<F>) -> bool {
+    if claims.len() != 3 || witnesses.len() != 3 || !sumcheck_proofs.is_empty() {
+      return false;
+    }
     let mut verified = true;
     let c_point = &claims[2].point;
 

@@ -86,6 +86,9 @@ impl<F: CryptoField> BasicBlock<F> for Permute {
     sumcheck_proofs: &[&SumcheckProof<F>],
     transcript: &mut Transcript<F>,
   ) -> bool {
+    if witnesses.is_empty() || claims.len() != 2 || sumcheck_proofs.len() != 1 {
+      return false;
+    }
     let x = witnesses[0];
     let out_claim = claims[claims.len() - 1]; // output claim
     let n = get_n(&x.shape);
@@ -100,6 +103,10 @@ impl<F: CryptoField> BasicBlock<F> for Permute {
         return false;
       }
     };
+    if claims[0].point != challenges {
+      println!("verified permute failed: input claim point mismatch");
+      return false;
+    }
 
     // Recompute permute_poly evaluated at challenges
     let output_shape_pow = shape_pow(&self.output_shape);

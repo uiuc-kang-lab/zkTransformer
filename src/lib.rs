@@ -11,11 +11,17 @@ use std::fs::File;
 use std::io::Read;
 
 pub static CONFIG_FILE: Lazy<String> = Lazy::new(|| {
-  let args: Vec<String> = env::args().collect();
-  if args.len() < 2 {
-    panic!("Usage: cargo run -- <config file>");
+  if let Ok(cfg) = env::var("ZKTRANSFORMER_CONFIG") {
+    return cfg;
   }
-  args[1].clone()
+  let args: Vec<String> = env::args().collect();
+  if args.len() >= 2 && std::path::Path::new(&args[1]).is_file() {
+    return args[1].clone();
+  }
+  if std::path::Path::new("config.yaml").is_file() {
+    return "config.yaml".to_string();
+  }
+  panic!("Usage: cargo run -- <config file> (or set ZKTRANSFORMER_CONFIG / provide config.yaml)");
 });
 
 // Define a static CONFIG that holds the loaded configuration

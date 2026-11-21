@@ -243,6 +243,12 @@ where
   P::ScalarField: CryptoField,
 {
   use crate::util::poly::pad_at_start;
+  if open.d_x.len() != srs.degree_x
+    || open.d_y.len() != srs.degree_y
+    || open.f_star.evaluations.len() != srs.degree_z
+  {
+    return false;
+  }
   let z_log = srs.degree_z.log_2();
   let y_log = srs.degree_y.log_2();
   let x_log = srs.degree_x.log_2();

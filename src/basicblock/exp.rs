@@ -88,11 +88,11 @@ impl<F: CryptoField> BasicBlock<F> for ExpHelper {
   fn verify(
     &self,
     _witnesses: &[&Witness<F>],
-    _claims: &[&Claim<F>],
-    _sumcheck_proofs: &[&SumcheckProof<F>],
+    claims: &[&Claim<F>],
+    sumcheck_proofs: &[&SumcheckProof<F>],
     _transcript: &mut Transcript<F>,
   ) -> bool {
-    true
+    sumcheck_proofs.is_empty() && claims.len() == 2 && claims[0].point == claims[1].point
   }
 }
 
@@ -108,7 +108,7 @@ impl<F: CryptoField> BasicBlock<F> for NonStructuredExp {
     let n: usize = x_shape.into_iter().product();
     let num_var = get_n(&x_shape);
 
-    let ln2 = (2.0_f32.ln() * *SF_FLOAT).round() as f64;
+    let ln2 = (2.0_f64.ln() * (*SF_FLOAT as f64)).round();
     let neg_ln2_f = <F as CryptoField>::zero() - F::from(ln2 as u32);
 
     let table_size = 1usize << 10;
@@ -153,7 +153,6 @@ impl<F: CryptoField> BasicBlock<F> for NonStructuredExp {
   ) -> (Vec<SumcheckProof<F>>, Vec<Claim<F>>) {
     assert!(witnesses.len() == 4, "NonStructuredExp expects 2 inputs and 2 outputs");
     assert!(edge_ids.len() == 4, "NonStructuredExp expects 2 input edges and 2 output edges");
-    let x = witnesses[0];
     let t = witnesses[1];
     let aux = witnesses[3];
 
@@ -166,27 +165,46 @@ impl<F: CryptoField> BasicBlock<F> for NonStructuredExp {
 
     let sumcheck_proof = sumcheck_prover.prove(&vec![w_partial_dense, t_poly], transcript);
     let challenges = sumcheck_prover.challenges;
-    let claim_x = Claim {
-      edge_id: edge_ids[0],
+    let claim_t = Claim {
+      edge_id: edge_ids[1],
       sparse_id: 0,
       point: challenges.clone(),
-      eval: x.data.as_ref().unwrap().evaluate_at_point(&challenges),
+      eval: sumcheck_prover.a_arrays[1][0],
     };
-    (vec![sumcheck_proof], vec![claim_x])
+    let aux_point: Vec<F> = out_claims[0].point.iter().chain(challenges.iter()).cloned().collect();
+    let claim_aux = Claim {
+      edge_id: edge_ids[3],
+      sparse_id: 0,
+      point: aux_point,
+      eval: sumcheck_prover.a_arrays[0][0],
+    };
+    (vec![sumcheck_proof], vec![claim_t, claim_aux])
   }
 
   fn verify(
     &self,
-    _witnesses: &[&Witness<F>],
+    witnesses: &[&Witness<F>],
     claims: &[&Claim<F>],
     sumcheck_proofs: &[&SumcheckProof<F>],
     transcript: &mut Transcript<F>,
   ) -> bool {
-    assert!(sumcheck_proofs.len() == 1, "NonStructuredExp expects 1 sumcheck proof");
-    let mut verifier = SumcheckVerifier::new(claims[0].point.len(), 2, transcript);
-    let expected_sum = sumcheck_proofs[0].round_messages[0][0] + sumcheck_proofs[0].round_messages[0][1];
-    let (verification_result, _challenges) = verifier.verify(transcript, sumcheck_proofs[0].round_messages.clone(), expected_sum);
-    verification_result.is_some()
+    if sumcheck_proofs.len() != 1 || claims.len() != 3 || witnesses.is_empty() {
+      return false;
+    }
+    let claim_t = claims[0];
+    let claim_aux = claims[1];
+    let out_claim = claims[2];
+    let table_vars = get_n(&witnesses[0].shape);
+    let mut verifier = SumcheckVerifier::new(table_vars, 2, transcript);
+    let expected_sum = out_claim.eval;
+    let (verification_result, challenges) = verifier.verify(transcript, sumcheck_proofs[0].round_messages.clone(), expected_sum);
+    let Some(running_sum) = verification_result else {
+      return false;
+    };
+    let expected_aux_point: Vec<F> = out_claim.point.iter().chain(challenges.iter()).cloned().collect();
+    claim_t.point == challenges
+      && claim_aux.point == expected_aux_point
+      && running_sum == claim_aux.eval * claim_t.eval
   }
 }
 

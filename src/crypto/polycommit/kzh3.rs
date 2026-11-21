@@ -797,6 +797,12 @@ pub fn kzh3_verify<P: PairingTrait>(
 where
   P::ScalarField: CryptoField,
 {
+  if open.d_x.len() != srs.degree_x
+    || open.d_y.len() != srs.degree_y
+    || open.f_star.evaluations.len() != srs.degree_z
+  {
+    return false;
+  }
   let split_input = split_input(srs, input, scalar_field_zero::<P::ScalarField>());
   let r_z = &split_input[0];
   let r_y = &split_input[1];
