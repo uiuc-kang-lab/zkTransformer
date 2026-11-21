@@ -421,7 +421,7 @@ pub fn get_cached_inverses<F: CryptoField + Send + Sync + 'static>() -> CachedIn
   // Compute inverses (only happens once per field type)
   let two_inv = <F as CryptoField>::from_u32(2).invert();
   let six_inv = <F as CryptoField>::from_u32(6).invert();
-  let ln2 = -((2.0_f32.ln() * *SF_FLOAT).round() as i128);
+  let ln2 = -((2.0_f64.ln() * (*SF_FLOAT as f64)).round() as i128);
   let neg_ln2_inv = F::from(ln2).invert();
   let inverses = CachedInverses {
     two_inv,
@@ -1347,7 +1347,7 @@ impl<F: CryptoField> SparseMLPoly<F> {
         })
         .collect::<Vec<(usize, usize)>>();
 
-      let block_selection_polynomial = SelectionPolynomial::new(selection.input_num_vars, block_size, block_selection);
+      let block_selection_polynomial = SelectionPolynomial::new(selection.input_num_vars, this_block_vars, block_selection);
       let block_selection_polynomial_sparse = block_selection_polynomial.to_sparse();
       blocks.push(block_selection_polynomial_sparse);
     }
@@ -1365,6 +1365,19 @@ pub fn range_dense<F: CryptoField>(num_vars: usize) -> DenseMLPoly<F> {
   DenseMLPoly::new(num_vars, evaluations)
 }
 
+/// Evaluates the multilinear extension of `range_dense(r.len())` at `r` in O(r.len()) field ops:
+///   T_range(k_0, ..., k_{m-1}) = sum_{j=0}^{m-1} 2^j * k_j  =>  \tilde{T}_range(r) = sum_{j=0}^{m-1} 2^j * r_j.
+pub fn evaluate_range_structured<F: CryptoField>(r: &[F]) -> F {
+  let mut acc = <F as CryptoField>::zero();
+  let mut pow2 = <F as CryptoField>::one();
+  let two = <F as CryptoField>::from_u32(2);
+  for &r_j in r {
+    acc = acc + pow2 * r_j;
+    pow2 = pow2 * two;
+  }
+  acc
+}
+
 pub fn two_pow_dense<F: CryptoField>(num_vars: usize) -> DenseMLPoly<F> {
   assert!(num_vars == 4, "two_pow_dense only supports 4 variables");
   let vec_len = 1 << num_vars;
@@ -1373,6 +1386,19 @@ pub fn two_pow_dense<F: CryptoField>(num_vars: usize) -> DenseMLPoly<F> {
     evaluations.push(F::from((1 << (15 - i)) as u32));
   }
   DenseMLPoly::new(num_vars, evaluations)
+}
+
+/// Evaluates the multilinear extension of `two_pow_dense(4)` (`table[k] = 2^(15 - k)`) at `r` in O(1) field ops:
+///   \tilde{T}_{two_pow}(r_0..r_3) = prod_{j=0}^3 (2^(2^j) * (1 - r_j) + r_j).
+pub fn evaluate_two_pow_structured<F: CryptoField>(r: &[F]) -> F {
+  assert_eq!(r.len(), 4, "evaluate_two_pow_structured expects 4 variables");
+  let one = <F as CryptoField>::one();
+  let mut prod = one;
+  for (j, &r_j) in r.iter().enumerate() {
+    let coeff = <F as CryptoField>::from_u32(1u32 << (1usize << j));
+    prod = prod * (coeff * (one - r_j) + r_j);
+  }
+  prod
 }
 
 pub fn fix_variables_zkgpt<F: CryptoField>(

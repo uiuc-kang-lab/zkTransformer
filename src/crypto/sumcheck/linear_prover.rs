@@ -490,16 +490,30 @@ impl<F: CryptoField> SparseBoolSumcheckProver<F> {
     eq_challenge: &[F],
     transcript: &mut Transcript<F>,
   ) -> SumcheckProof<F> {
-    assert_eq!(weights.len(), positions.len());
+    let one = <F as CryptoField>::one();
+    let term_entries: Vec<Vec<(usize, F)>> = positions
+      .iter()
+      .map(|pos| pos.iter().map(|&idx| (idx, one)).collect())
+      .collect();
+    self.prove_with_entries(weights, &term_entries, eq_challenge, transcript)
+  }
+
+  /// Run the booleanity sumcheck directly on sparse `(index, value)` entries.
+  pub fn prove_with_entries(
+    &mut self,
+    weights: &[F],
+    term_entries: &[Vec<(usize, F)>],
+    eq_challenge: &[F],
+    transcript: &mut Transcript<F>,
+  ) -> SumcheckProof<F> {
+    assert_eq!(weights.len(), term_entries.len());
     assert_eq!(eq_challenge.len(), self.num_var);
 
-    // Initialize terms with sorted entries, each position has value = 1.
     self.terms = weights
       .iter()
-      .zip(positions.iter())
-      .map(|(&w, pos)| {
-        let one = <F as CryptoField>::one();
-        let mut entries: Vec<(usize, F)> = pos.iter().map(|&idx| (idx, one)).collect();
+      .zip(term_entries.iter())
+      .map(|(&w, raw_entries)| {
+        let mut entries: Vec<(usize, F)> = raw_entries.clone();
         entries.sort_unstable_by_key(|&(idx, _)| idx);
         (w, entries)
       })
@@ -522,6 +536,18 @@ impl<F: CryptoField> SparseBoolSumcheckProver<F> {
 
     let final_eval = self.final_evaluation();
     SumcheckProof { final_eval, round_messages }
+  }
+
+  /// Return the exact MLE evaluation `s_j(self.challenges)` of term `term_idx` after all rounds.
+  pub fn term_final_eval(&self, term_idx: usize) -> F {
+    assert_eq!(self.current_round, self.num_var);
+    let zero = <F as CryptoField>::zero();
+    let (_, entries) = &self.terms[term_idx];
+    if entries.is_empty() || entries[0].0 != 0 {
+      zero
+    } else {
+      entries[0].1
+    }
   }
 
   /// Compute round polynomial T(c) for c ∈ {0, 1, 2, 3} in a single pass

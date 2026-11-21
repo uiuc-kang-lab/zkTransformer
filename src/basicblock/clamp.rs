@@ -40,7 +40,7 @@ impl<F: CryptoField> BasicBlock<F> for ClampLower {
       if x_i_int < -c_i128 { clamped += 1; y_data[i] = neg_c; } else { y_data[i] = x_i; }
     }
     let _ = (x_min, x_max, clamped, n);
-    vec![Witness::new(x.shape.clone(), y_data, x.data_type, x.sf, Role::Output)]
+    vec![Witness::new(x.shape.clone(), y_data, x.data_type, x.sf, Role::Auxiliary)]
   }
 
   fn prove(
@@ -62,11 +62,11 @@ impl<F: CryptoField> BasicBlock<F> for ClampLower {
   fn verify(
     &self,
     _witnesses: &[&Witness<F>],
-    _claims: &[&Claim<F>],
-    _sumcheck_proofs: &[&SumcheckProof<F>],
+    claims: &[&Claim<F>],
+    sumcheck_proofs: &[&SumcheckProof<F>],
     _transcript: &mut Transcript<F>,
   ) -> bool {
-    true
+    sumcheck_proofs.is_empty() && claims.len() == 2 && claims[0].point == claims[1].point
   }
 }
 

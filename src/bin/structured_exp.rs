@@ -49,10 +49,12 @@ fn main() {
   let mut dense_commitments: Vec<Option<KZH3Commitment<PairingType>>> = vec![None; dag.num_edges()];
   let mut sparse_commitments: Vec<Option<Vec<KZH3Commitment<PairingType>>>> = vec![None; dag.num_edges()];
 
-  // Witness generation from input
+  // Witness generation from non-positive inputs q ∈ {0, -1, ..., -1023} (Paper §4)
   let input = Witness::new(
     vec![1024],
-    (0..1024).map(|i| <F as CryptoField>::from_u32(i as u32)).collect(),
+    (0..1024)
+      .map(|i| <F as CryptoField>::zero() - <F as CryptoField>::from_u32(i as u32))
+      .collect(),
     DataType::Float,
     *SF_LOG as usize,
     Role::Input,
@@ -95,14 +97,16 @@ fn main() {
   let sparse_verifier_key = SparseKZH3VerifierKey { srs_map: srs_map.clone() };
 
   // Commit to all witnesses
-  dag.commit::<F, KZH3Commit<PairingType>, SparseKZH3Commit<PairingType>>(
-    &kzh3,
-    &sparse_kzh3,
-    &init,
-    &mut dense_commitments,
-    &mut sparse_commitments,
-    &mut timing,
-  );
+  timed!(timing, "commit", {
+    dag.commit::<F, KZH3Commit<PairingType>, SparseKZH3Commit<PairingType>>(
+      &kzh3,
+      &sparse_kzh3,
+      &init,
+      &mut dense_commitments,
+      &mut sparse_commitments,
+      &mut timing,
+    );
+  });
 
   let (sumcheck_proofs, opening_proofs, range_proof, two_pow_proof, reducer_proofs) = timed!(
     timing,

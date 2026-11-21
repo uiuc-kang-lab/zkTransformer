@@ -422,11 +422,9 @@ pub trait MLPolyCommit<F: CryptoField, P: MLPoly<F>> {
   fn commit(poly: &P, key: &Self::CommitmentKey) -> Self::Commitment;
   fn open(commitment: &Self::Commitment, poly: &P, key: &Self::CommitmentKey, point: &[F]) -> Self::Proof;
   fn verify(commitment: &Self::Commitment, proof: &Self::Proof, key: &Self::VerifierKey, point: &[F]) -> bool;
-  /// Verify and extract the opened evaluation value from the proof.
+  /// Verify and extract the opened evaluation value from the proof using the trusted VerifierKey.
   /// Returns (pairing_ok, opened_eval). The caller must check opened_eval == claim.eval.
-  fn verify_and_extract(commitment: &Self::Commitment, proof: &Self::Proof, key: &Self::VerifierKey, point: &[F]) -> (bool, F) {
-    (Self::verify(commitment, proof, key, point), <F as CryptoField>::zero())
-  }
+  fn verify_and_extract(commitment: &Self::Commitment, proof: &Self::Proof, key: &Self::VerifierKey, point: &[F]) -> (bool, F);
   fn batch_open(commitments: &[Self::Commitment], polys: &[P], keys: &[Self::CommitmentKey], point: &[F]) -> Self::BatchProof;
   fn batch_verify(commitments: &[Self::Commitment], proofs: &[Self::Proof], keys: &[Self::VerifierKey], point: &[F]) -> bool;
 }

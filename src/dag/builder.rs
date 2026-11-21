@@ -86,10 +86,12 @@ impl<F: CryptoField + 'static> DagBuilder<F> {
   }
 
   pub fn add_nonneg_node(&mut self, a: EdgeId) {
+    self.add_nonneg_node_with_bits(a, *TABLE_SIZE_LOG);
+  }
+
+  pub fn add_nonneg_node_with_bits(&mut self, a: EdgeId, table_size_log: usize) {
     let nid = self.nodes.len();
-    let nonneg_basicblock = BasicBlockType::NonNegative(NonNegative {
-      table_size_log: *TABLE_SIZE_LOG,
-    });
+    let nonneg_basicblock = BasicBlockType::NonNegative(NonNegative { table_size_log });
     let _ = self.add_gkr_node(vec![a], nonneg_basicblock);
     self.init_values.push(Some(Witness::new_wo_data(vec![1], DataType::Float, 0, Role::Auxiliary)));
     self.range.push(nid);
@@ -128,15 +130,16 @@ impl<F: CryptoField + 'static> DagBuilder<F> {
     let ln2_sf = (2.0_f64.ln() * sf_val).round() as u64;
     let c_val: u64 = 14 * ln2_sf;
 
-    // y = ClampLower(x)
+    // y = ClampLower(x) — must be Role::Auxiliary (committed) because ClampLower::verify
+    // cannot algebraically determine y from x, and Reducer on y requires a committed target.
     let clamp_bb = BasicBlockType::ClampLower(ClampLower { c: c_val });
     let y = self.add_gkr_node(vec![x], clamp_bb)[0];
-    self.init_values.push(Some(Witness::new_wo_data(shape.clone(), data_type, sf, Role::Output)));
+    self.init_values.push(Some(Witness::new_wo_data(shape.clone(), data_type, sf, Role::Auxiliary)));
 
-    // delta = y - x, range-check delta ≥ 0
+    // delta = y - x, range-check delta ≥ 0 (accommodate -1000·2^sf causal masks at both sf=10 and sf=15)
     let delta = self.sub(y, x)[0];
     let delta_flat = self.change_shape(delta, flat_shape.clone());
-    self.add_nonneg_node(delta_flat);
+    self.add_nonneg_node_with_bits(delta_flat, (*TABLE_SIZE_LOG).max(sf + 11));
 
     // u = y + C, range-check u ≥ 0
     let n_real: usize = shape.iter().product();
@@ -345,6 +348,39 @@ impl<F: CryptoField + 'static> DagBuilder<F> {
     let outs = self.add_gkr_node(vec![a], exp_basicblock); // x --> k * (-ln(2)*sf) + r
     let mut r = outs[0]; // dense poly
     let k = outs[1]; // sparse poly
+
+    // Enforce the bijective remainder bound r ∈ [-floor((L - 1) / 2), floor(L / 2)]
+    // where L = round(2^sf * ln 2) (Paper §4: |r| <= 2^s * ln 2 / 2).
+    // Because (r + r_min) + (r_max - r) = L - 1 < 2^rem_bits << p, proving both
+    // (r + r_min) ∈ [0, 2^rem_bits) and (r_max - r) ∈ [0, 2^rem_bits) enforces
+    // r ∈ [-r_min, r_max] over Z with zero integer slack.
+    {
+      let sf_log = *SF_LOG as usize;
+      let ln2_sf = (2.0_f64.ln() * ((1u64 << sf_log) as f64)).round() as u64;
+      let r_min_mag = (ln2_sf - 1) / 2;
+      let r_max_mag = ln2_sf / 2;
+      let rem_bits = ln2_sf.next_power_of_two().trailing_zeros() as usize;
+
+      let r_flat_check = self.change_shape(r, flat_shape.clone());
+      let r_min_const = self.param(Witness::new(
+        vec![1],
+        vec![F::from(r_min_mag as u32)],
+        data_type,
+        sf_log,
+        Role::Constant,
+      ));
+      let r_max_const = self.param(Witness::new(
+        vec![1],
+        vec![F::from(r_max_mag as u32)],
+        data_type,
+        sf_log,
+        Role::Constant,
+      ));
+      let r_low = self.add(r_flat_check, r_min_const)[0];
+      let r_high = self.sub(r_max_const, r_flat_check)[0];
+      self.add_nonneg_node_with_bits(r_low, rem_bits);
+      self.add_nonneg_node_with_bits(r_high, rem_bits);
+    }
 
     r = self.scale(r, *SF_LOG as usize, 15)[0];
 

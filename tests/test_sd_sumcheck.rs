@@ -11,69 +11,52 @@ use icicle_bn254::curve::ScalarField as F;
 #[cfg(all(feature = "icicle", feature = "goldilocks"))]
 use icicle_goldilocks::field::ScalarField as F;
 
-use std::collections::{HashMap, VecDeque};
-use zktransformer::crypto::table::BitDecomp;
-use zktransformer::crypto::table::DummyTable;
-use zktransformer::crypto::table::StructuredTable;
-use zktransformer::crypto::{SparseDenseSumcheckProver, SumcheckProver, SumcheckVerifier};
-use zktransformer::util::poly::{CryptoField, SparseMLPoly};
-use zktransformer::util::transcript::Transcript;
+use zk_torch_2::crypto::{SparseBoolSumcheckProver, SumcheckVerifier};
+use zk_torch_2::util::poly::{
+  evaluate_range_structured, evaluate_two_pow_structured, range_dense, two_pow_dense,
+  CryptoField, MLPoly, SelectionPolynomial,
+};
+use zk_torch_2::util::transcript::Transcript;
 
 #[test]
-fn test_sd_sumcheck_basic_structured_table() {
-  let n = 64; // 64 variable - simpler case
+fn test_structured_tables_match_dense_mle() {
+  let r4 = vec![
+    <F as CryptoField>::from_u32(3),
+    <F as CryptoField>::from_u32(7),
+    <F as CryptoField>::from_u32(11),
+    <F as CryptoField>::from_u32(13),
+  ];
+  assert_eq!(evaluate_range_structured(&r4), range_dense::<F>(4).evaluate_at_point(&r4));
+  assert_eq!(evaluate_two_pow_structured(&r4), two_pow_dense::<F>(4).evaluate_at_point(&r4));
 
-  // Create a sparse polynomial a(x) with a few non-zero entries
-  // For n=2, we need to use the right indices that will work with the bit decomposition
-  // The bit representation for 2 variables needs 2-bit indices
-  // We need to ensure the sparse keys work correctly with the algorithm
-  let mut a_map = HashMap::new();
-  let mut a_keys = VecDeque::new();
+  let r2 = vec![<F as CryptoField>::from_u32(5), <F as CryptoField>::from_u32(9)];
+  assert_eq!(evaluate_range_structured(&r2), range_dense::<F>(2).evaluate_at_point(&r2));
+}
 
-  // Use only even indices (can be paired) to avoid the pairing issues
-  a_map.insert(vec![3], <F as CryptoField>::from_u32(1u32));
-  a_keys.push_back(vec![3]);
-  a_map.insert(vec![7], <F as CryptoField>::from_u32(1u32));
-  a_keys.push_back(vec![7]);
+#[test]
+fn test_sparse_bool_sumcheck_completeness_and_terminal_eval() {
+  let sel = SelectionPolynomial::<F>::new(2, 4, vec![(0, 3), (1, 7), (2, 0), (3, 15)]).to_sparse();
+  let entries: Vec<(usize, F)> = sel.evaluations.iter().map(|(&k, &v)| (k, v)).collect();
+  let w = <F as CryptoField>::from_u32(19);
 
-  let sparse_poly: SparseMLPoly<F> = SparseMLPoly::new(n, a_map, a_keys);
+  let mut p_tx = Transcript::new(b"sparse_bool_test");
+  let mut prover = SparseBoolSumcheckProver::<F>::new(6, &mut p_tx);
+  let eq_ch: Vec<F> = (0..6).map(|_| p_tx.challenge_scalar(b"challenge")).collect();
+  let proof = prover.prove_with_entries(&[w], &[entries], &eq_ch, &mut p_tx);
 
-  // Create structured table (BitDecomp) for polynomial b(x)
-  let table: BitDecomp = <BitDecomp as StructuredTable<F>>::new(n, 0, 0, 0);
+  let mut v_tx = Transcript::new(b"sparse_bool_test");
+  let mut verifier = SumcheckVerifier::new(6, 3, &mut v_tx);
+  let v_eq_ch: Vec<F> = (0..6).map(|_| v_tx.challenge_scalar(b"challenge")).collect();
+  let (res, r_bool) = verifier.verify(&mut v_tx, proof.round_messages, <F as CryptoField>::zero());
+  let running_sum = res.expect("SparseBoolSumcheckProver honest proof must verify");
 
-  // Create the prover instance
-  let mut transcript = Transcript::new(b"sd_sumcheck");
-  let instances = (vec![sparse_poly], zktransformer::crypto::sumcheck::sd_prover::Val::Structured(table));
-  let mut prover: SparseDenseSumcheckProver<F, BitDecomp, DummyTable> = SparseDenseSumcheckProver::new(n, 2, &mut transcript);
+  let term_eval = prover.term_final_eval(0);
+  assert_eq!(term_eval, sel.evaluate_at_point(&r_bool));
 
-  // Run the proof
-  let sumcheck_proof = prover.prove(&instances, &mut transcript);
-
-  // Basic protocol structure verification
-  assert_eq!(sumcheck_proof.round_messages.len(), n, "Should have {} round messages", n);
-
-  // Each round message should have 3 evaluations (for points 0, 1, 2)
-  for (round, message) in sumcheck_proof.round_messages.iter().enumerate() {
-    assert_eq!(message.len(), 3, "Round {} should have 3 evaluations", round);
-
-    // Verify all evaluations are valid field elements
-    for &val in message.iter() {
-      let _test = val + <F as CryptoField>::zero(); // This will fail if val is invalid
-    }
-  }
-
-  // Verify final evaluation is a valid field element
-  let _test_final = sumcheck_proof.final_eval + <F as CryptoField>::zero();
-
-  // Test verifier accepts the proof
-  let mut verifier_transcript = Transcript::new(b"sd_sumcheck");
-  let mut verifier = SumcheckVerifier::new(n, 2, &mut verifier_transcript);
-
-  // Calculate expected sum for verification
-  // For our sparse polynomial: a(2) = 1, and BitDecomp table evaluates to 2 at point (0,1)
-  // So the expected sum should be 1 * 2 = 2
-  let expected_sum = <F as CryptoField>::from_u32(10u32);
-  let (verification_result, _) = verifier.verify(&mut verifier_transcript, sumcheck_proof.round_messages, expected_sum);
-
-  assert!(verification_result.is_some(), "Verifier should accept the proof");
+  let one = <F as CryptoField>::one();
+  let eq_eval = v_eq_ch
+    .iter()
+    .zip(r_bool.iter())
+    .fold(one, |acc, (&ec, &rb)| acc * (rb * ec + (one - rb) * (one - ec)));
+  assert_eq!(running_sum, eq_eval * w * term_eval * (term_eval - one));
 }

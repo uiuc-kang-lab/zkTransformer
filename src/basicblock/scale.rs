@@ -88,11 +88,11 @@ impl<F: CryptoField> BasicBlock<F> for ScaleDown {
   fn verify(
     &self,
     _witnesses: &[&Witness<F>],
-    _claims: &[&Claim<F>],
-    _sumcheck_proofs: &[&SumcheckProof<F>],
+    claims: &[&Claim<F>],
+    sumcheck_proofs: &[&SumcheckProof<F>],
     _transcript: &mut Transcript<F>,
   ) -> bool {
-    true
+    sumcheck_proofs.is_empty() && claims.len() == 2 && claims[0].point == claims[1].point
   }
 }
 
@@ -178,10 +178,10 @@ impl<F: CryptoField> BasicBlock<F> for ScaleUp {
   fn verify(
     &self,
     _witnesses: &[&Witness<F>],
-    _claims: &[&Claim<F>],
-    _sumcheck_proofs: &[&SumcheckProof<F>],
+    claims: &[&Claim<F>],
+    sumcheck_proofs: &[&SumcheckProof<F>],
     _transcript: &mut Transcript<F>,
   ) -> bool {
-    true
+    sumcheck_proofs.is_empty() && claims.len() == 2 && claims[0].point == claims[1].point
   }
 }

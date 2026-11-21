@@ -582,9 +582,16 @@ impl<F: CryptoField> BasicBlock<F> for Einsum {
   }
 
   fn verify(&self, witnesses: &[&Witness<F>], claims: &[&Claim<F>], sumcheck_proofs: &[&SumcheckProof<F>], transcript: &mut Transcript<F>) -> bool {
+    if claims.is_empty() || witnesses.len() != claims.len() || sumcheck_proofs.len() != 1 {
+      return false;
+    }
     let shapes = witnesses.iter().map(|i| i.shape.clone()).collect::<Vec<Vec<usize>>>();
     let out_claim = claims[claims.len() - 1];
-    let (_, _, high_degree_challenge, summation_round) = einsum_helper(&self.equation, &shapes, &out_claim.point);
+    let (permute_vecs, degree_one_challenges, high_degree_challenge, summation_round) =
+      einsum_helper(&self.equation, &shapes, &out_claim.point);
+    if claims.len() != permute_vecs.len() + 1 {
+      return false;
+    }
     let num_first_rounds = high_degree_challenge.len();
     let num_second_rounds = summation_round;
 
@@ -598,6 +605,30 @@ impl<F: CryptoField> BasicBlock<F> for Einsum {
         return false;
       }
     };
+
+    // Verify each input claim's evaluation point matches the exact permuted/unpermuted challenge point
+    for i in 0..permute_vecs.len() {
+      let n = get_n(&witnesses[i].shape);
+      let is_identity_perm = {
+        let mut pos = 0usize;
+        permute_vecs[i].iter().all(|&(s, e)| {
+          let ok = s == pos;
+          pos = e;
+          ok
+        }) && pos == n
+      };
+      let pre_permuted = is_identity_perm || matches!(&witnesses[i].is_permuted_with, Some(p) if p == &permute_vecs[i]);
+      let point_i_perm: Vec<F> = degree_one_challenges[i].iter().chain(challenges.iter()).cloned().collect();
+      let expected_point = if pre_permuted {
+        point_i_perm
+      } else {
+        invert_points_by_ranges(&point_i_perm, &permute_vecs[i])
+      };
+      if claims[i].point != expected_point {
+        println!("verified einsum failed: input {i} claim point mismatch eq={}", self.equation);
+        return false;
+      }
+    }
 
     // Final eval check: running_sum == eq_eval * Π_{i} claims[i].eval
     let one = <F as CryptoField>::one();

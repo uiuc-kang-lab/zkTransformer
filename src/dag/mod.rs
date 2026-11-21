@@ -4,7 +4,7 @@ use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use ndarray::ArrayD;
 use plonky2::{timed, util::timing::TimingTree};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::basicblock::einsum::{einsum_input_permutes, permute_evals_by_ranges};
 use crate::basicblock::{reducer::Reducer, BasicBlock, BasicBlockType};
@@ -14,7 +14,10 @@ use crate::crypto::{LinearSumcheckProver, SparseBoolSumcheckProver, SumcheckVeri
 use crate::util::arith::calc_pow;
 use crate::util::arith::{f_to_int, get_n};
 use crate::util::poly::CryptoField;
-use crate::util::poly::{evaluate_lagrange_basis, get_cached_inverses, range_dense, two_pow_dense, DenseMLPoly, MLPoly, SparseMLPoly};
+use crate::util::poly::{
+  evaluate_lagrange_basis, evaluate_range_structured, evaluate_two_pow_structured,
+  get_cached_inverses, range_dense, two_pow_dense, DenseMLPoly, MLPoly, SparseMLPoly,
+};
 use crate::TABLE_COMMIT_LOG;
 
 #[cfg(feature = "arkworks")]
@@ -618,10 +621,72 @@ impl Dag {
     }
   }
 
+  fn is_advice_output_edge(&self, edge_id: EdgeId) -> bool {
+    let Some(p) = self.producers[edge_id] else {
+      return false;
+    };
+    let node = &self.nodes[p];
+    match &node.kind {
+      BasicBlockType::ClampLower(_)
+      | BasicBlockType::RMSReciprocal(_)
+      | BasicBlockType::Reciprocal(_)
+      | BasicBlockType::DivConst(_)
+      | BasicBlockType::SoftmaxConst(_)
+      | BasicBlockType::SigmoidConst(_) => node.outputs.first() == Some(&edge_id),
+      _ => false,
+    }
+  }
+
+  fn is_sparse_aux_edge(&self, edge_id: EdgeId) -> bool {
+    if let Some(p) = self.producers[edge_id] {
+      let node = &self.nodes[p];
+      match &node.kind {
+        BasicBlockType::NonNegative(_) => node.outputs.first() == Some(&edge_id),
+        BasicBlockType::ScaleDown(_)
+        | BasicBlockType::ScaleUp(_)
+        | BasicBlockType::ExpHelper(_)
+        | BasicBlockType::NonStructuredExp(_) => node.outputs.get(1) == Some(&edge_id),
+        _ => false,
+      }
+    } else {
+      self.two_pow.iter().any(|&tp| self.nodes[tp].inputs.first() == Some(&edge_id))
+    }
+  }
+
+  fn must_commit_edge(&self, edge_id: EdgeId) -> bool {
+    self.producers[edge_id].is_none()
+      || self.is_advice_output_edge(edge_id)
+      || self.is_sparse_aux_edge(edge_id)
+      || self.consumers[edge_id].is_empty()
+  }
+
   fn should_commit<F: CryptoField + 'static>(&self, witness: &Witness<F>, edge_id: EdgeId) -> bool {
+    if self.must_commit_edge(edge_id) {
+      return true;
+    }
     match witness.role {
       Role::Constant | Role::Auxiliary | Role::Input => true,
       Role::Output => self.consumers[edge_id].is_empty(),
+    }
+  }
+
+  fn range_node_total_bits(&self, nid: NodeId) -> usize {
+    match &self.nodes[nid].kind {
+      BasicBlockType::ScaleDown(sd) => sd.input_sf - sd.output_sf,
+      BasicBlockType::ScaleUp(su) => su.output_sf - su.input_sf,
+      BasicBlockType::ExpHelper(_) => crate::basicblock::exp::K_BITS,
+      BasicBlockType::NonNegative(nn) => nn.table_size_log,
+      other => panic!("Unexpected node kind in range: {:?}", other),
+    }
+  }
+
+  fn range_block_table_vars(&self, nid: NodeId, num_blocks: usize, sparse_id: usize) -> usize {
+    let total_bits = self.range_node_total_bits(nid);
+    if total_bits == 0 || num_blocks <= 1 {
+      total_bits
+    } else {
+      let offset = sparse_id.saturating_mul(*TABLE_COMMIT_LOG);
+      total_bits.saturating_sub(offset).min(*TABLE_COMMIT_LOG)
     }
   }
 
@@ -639,31 +704,31 @@ impl Dag {
     SP: MLPolyCommit<F, SparseMLPoly<F>>,
   {
     for (e, witness) in witnesses.iter().enumerate() {
-      if witness.len() > 0 {
-        for w in witness.iter() {
-          if self.should_commit(w, e) && w.data.is_some() {
-            match w.poly_type {
-              PolyType::Dense => {
-                if dense_commitments[e].is_none() {
-                  let poly = w.data.as_ref().unwrap().as_any().downcast_ref::<DenseMLPoly<F>>().unwrap();
-                  if w.role == Role::Constant {
-                    timed!(timing, format!("commit to constant for edge {}", e).as_str(), {
-                      dense_commitments[e] = Some(DP::commit(poly, dense_key));
-                    });
-                  } else {
-                    dense_commitments[e] = Some(DP::commit(poly, dense_key));
-                  }
-                }
+      if !witness.is_empty() && self.should_commit(&witness[0], e) && witness[0].data.is_some() {
+        match witness[0].poly_type {
+          PolyType::Dense => {
+            if dense_commitments[e].is_none() {
+              let w = &witness[0];
+              let poly = w.data.as_ref().unwrap().as_any().downcast_ref::<DenseMLPoly<F>>().unwrap();
+              if w.role == Role::Constant {
+                timed!(timing, format!("commit to constant for edge {}", e).as_str(), {
+                  dense_commitments[e] = Some(DP::commit(poly, dense_key));
+                });
+              } else {
+                dense_commitments[e] = Some(DP::commit(poly, dense_key));
               }
-              PolyType::Sparse => {
-                if sparse_commitments[e].is_none() {
+            }
+          }
+          PolyType::Sparse => {
+            if sparse_commitments[e].is_none() {
+              let comms: Vec<SP::Commitment> = witness
+                .iter()
+                .map(|w| {
                   let poly = w.data.as_ref().unwrap().as_any().downcast_ref::<SparseMLPoly<F>>().unwrap();
-                  if sparse_commitments[e].is_none() {
-                    sparse_commitments[e] = Some(vec![]);
-                  }
-                  sparse_commitments[e].as_mut().unwrap().push(SP::commit(poly, sparse_key));
-                }
-              }
+                  SP::commit(poly, sparse_key)
+                })
+                .collect();
+              sparse_commitments[e] = Some(comms);
             }
           }
         }
@@ -723,48 +788,46 @@ impl Dag {
     let mut edge_proofs: Vec<EdgeProof<F, DP, SP>> = Vec::with_capacity(self.num_edges);
     edge_proofs.resize_with(self.num_edges, || EdgeProof::new());
 
-    // 2. open the final output polynomials at some random points
+    // 2. open the final output / sink polynomials at fresh Fiat-Shamir challenge points
     let mut claims: Vec<Vec<Claim<F>>> = Vec::with_capacity(self.num_edges);
     claims.resize_with(self.num_edges, || Vec::new());
     let mut nodes_to_prove = BTreeSet::new();
-    self.output_ports.iter().for_each(|&e| {
+    for &e in &self.output_ports {
       let w = &witnesses[e][0];
-      if w.role == Role::Output {
-        let point: Vec<F> = (0..w.data.as_ref().unwrap().n()).map(|_| transcript.challenge_scalar(b"challenge")).collect();
+      let is_active_output = w.poly_type == PolyType::Dense && (w.role == Role::Output || !self.consumers[e].is_empty());
+      if !is_active_output {
+        continue;
+      }
+      if claims[e].is_empty() {
+        let point: Vec<F> = (0..get_n(&w.shape)).map(|_| transcript.challenge_scalar(b"challenge")).collect();
         let eval = w.data.as_ref().unwrap().evaluate_at_point(&point);
+        transcript.append_scalar(b"output_claim_eval", &eval);
         claims[e].push(Claim {
           edge_id: e,
           sparse_id: 0,
           point,
           eval,
         });
-        if self.consumers[e].len() > 0
-          && matches!(
-            self.nodes[self.consumers[e][0]].kind,
-            BasicBlockType::NonNegative(_) | BasicBlockType::ZeroCheck(_)
-          )
-        {
-          node_proofs[self.consumers[e][0]] = Some((vec![], vec![claims[e][0].clone()]));
-        }
-        nodes_to_prove.insert(self.producers[e].unwrap());
       }
-    });
+      for &cid in &self.consumers[e] {
+        if matches!(
+          self.nodes[cid].kind,
+          BasicBlockType::NonNegative(_) | BasicBlockType::ZeroCheck(_)
+        ) {
+          node_proofs[cid] = Some((vec![], vec![claims[e][0].clone()]));
+        }
+      }
+      if let Some(prod) = self.producers[e] {
+        nodes_to_prove.insert(prod);
+      }
+    }
 
-    // 2. prove from outputs to inputs by looping the following steps:
-    // 2.1 pop a node from nodes_to_prove
-    // 2.2 check if all the consumers of the node output(s) are not in nodes_to_prove
-    // 2.2.1 if no, then add the node to preserve_nodes, and pop a node from nodes_to_prove and go to 2.2
-    // 2.2.2 if yes, then go to 2.3
-    // 2.3 proving and adding the claims to claims
-    // 2.4 add the producer of the node input to preserve_nodes
+    // 2. prove from outputs to inputs in reverse-topological order
     let mut preserve_nodes = BTreeSet::new();
-    // Pre-compute consumer sets for faster lookups
     let consumer_sets: Vec<BTreeSet<NodeId>> = self.consumers.iter().map(|consumers| consumers.iter().copied().collect()).collect();
 
     while !nodes_to_prove.is_empty() {
-      // 2.1
       let node_id = nodes_to_prove.pop_last().unwrap();
-      // 2.2 - Optimized consumer check using pre-computed sets
       let mut can_prove = true;
       for &edge in &self.nodes[node_id].outputs {
         if consumer_sets[edge].iter().any(|&c| nodes_to_prove.contains(&c)) {
@@ -776,32 +839,27 @@ impl Dag {
         nodes_to_prove.insert(node_id);
         continue;
       }
-      // 2.3 - Optimized witness and claim collection
       let node = &self.nodes[node_id];
 
-      // Avoid temporary Vec allocation by using slices directly when possible
       let total_edges = node.inputs.len() + node.outputs.len();
       let mut edge_ids = Vec::with_capacity(total_edges);
       edge_ids.extend_from_slice(&node.inputs);
       edge_ids.extend_from_slice(&node.outputs);
 
-      // Pre-allocate with exact capacity
       let mut local_witnesses = Vec::with_capacity(edge_ids.len());
       for &e in &edge_ids {
         local_witnesses.push(&witnesses[e][0]);
       }
 
-      // Optimized claim collection without flatten
       let mut local_claims = Vec::new();
       for &e in &node.outputs {
         local_claims.extend(claims[e].iter());
       }
 
-      // if the node has multiple output claims, then we need to prove the reducer to reduce the claims
       let (reducer_proof, reducer_claims) = if local_claims.len() > 1 {
         println!("proving reducer for node {} | kind {:?}", node_id, self.nodes[node_id].kind);
         let reducer_witness = vec![&witnesses[node.outputs[0]][0]];
-        let reducer_edge_ids = vec![edge_ids[edge_ids.len() - 1]];
+        let reducer_edge_ids = vec![node.outputs[0]];
         let (proofs, new_claims) = timed!(
           timing,
           format!("prove reducer for node {} | kind {:?}", node_id, self.nodes[node_id].kind).as_str(),
@@ -811,7 +869,7 @@ impl Dag {
       } else {
         (vec![], vec![])
       };
-      if reducer_claims.len() > 0 {
+      if !reducer_claims.is_empty() {
         local_claims = reducer_claims.iter().collect();
         let output_edge_id = node.outputs[0];
         claims[output_edge_id].push(reducer_claims[0].clone());
@@ -826,7 +884,11 @@ impl Dag {
         { self.nodes[node_id].kind.prove(&local_witnesses, &edge_ids, &local_claims, transcript) }
       );
 
-      // Optimized node claims construction
+      // Absorb intermediate input claim evaluations into Fiat-Shamir transcript
+      for c in &new_claims {
+        transcript.append_scalar(b"node_claim_eval", &c.eval);
+      }
+
       let mut node_claims = Vec::with_capacity(new_claims.len() + local_claims.len());
       node_claims.extend_from_slice(&new_claims);
       for claim in local_claims {
@@ -837,25 +899,24 @@ impl Dag {
       for c in new_claims {
         claims[c.edge_id].push(c);
       }
-      // 2.4 - Optimized producer collection and set operations
       for &e in &node.inputs {
         if let Some(producer) = self.producers[e] {
           preserve_nodes.insert(producer);
         }
       }
 
-      // Avoid expensive union + collect by extending in-place
       for &preserve_node in &preserve_nodes {
         nodes_to_prove.insert(preserve_node);
       }
       preserve_nodes.clear();
     }
 
-    claims.iter().enumerate().for_each(|(e, c)| edge_proofs[e].claims.extend(c.iter().cloned()));
-
-    // 3. prove lookups
-    let (two_pow_table_proofs, two_pow_middle_claims, two_pow_bool_proofs) = self.prove_two_pow(witnesses, &mut claims, transcript, timing);
-    let (range_table_proofs, range_middle_claims, range_bool_proofs) = self.prove_range(witnesses, &mut claims, &node_proofs, transcript, timing);
+    // 3. prove lookups BEFORE populating `edge_proofs` so sparse lookup & booleanity
+    //    claims are included and opened via `SP::open`!
+    let (two_pow_table_proofs, two_pow_middle_claims, two_pow_bool_proofs) =
+      self.prove_two_pow(witnesses, &mut claims, transcript, timing);
+    let (range_table_proofs, range_middle_claims, range_bool_proofs) =
+      self.prove_range(witnesses, &mut claims, &node_proofs, transcript, timing);
     let two_pow_proof = LookupProof {
       table_proofs: two_pow_table_proofs,
       middle_claims: two_pow_middle_claims,
@@ -867,16 +928,17 @@ impl Dag {
       bool_proofs: range_bool_proofs,
     };
 
-    // 4. provide opening proofs for all the irreducible claims
+    claims.iter().enumerate().for_each(|(e, c)| edge_proofs[e].claims.extend(c.iter().cloned()));
+
+    // 4. provide opening proofs for all committed edges (including sparse lookup polys and final outputs)
     println!("proving opening proofs");
     timed!(timing, "provide opening proofs", {
-      // Collect dense and sparse opening tasks separately
       let mut dense_tasks = Vec::new();
       let mut sparse_tasks = Vec::new();
 
       for e in 0..self.num_edges {
         let w = &witnesses[e][0];
-        if w.role == Role::Output {
+        if !self.should_commit(w, e) {
           continue;
         }
         for c in &edge_proofs[e].claims {
@@ -888,15 +950,14 @@ impl Dag {
         }
       }
 
-      // Compute dense openings in parallel (arkworks) or sequentially (icicle)
       #[cfg(feature = "arkworks")]
       let dense_results: Vec<_> = dense_tasks
         .par_iter()
         .map(|(e, claim)| {
           let w = &witnesses[*e][0];
           let proof = DP::open(
-            &dense_commitments[*e].as_ref().unwrap(),
-            &w.data.as_ref().unwrap().as_any().downcast_ref::<DenseMLPoly<F>>().unwrap(),
+            dense_commitments[*e].as_ref().unwrap(),
+            w.data.as_ref().unwrap().as_any().downcast_ref::<DenseMLPoly<F>>().unwrap(),
             dense_key,
             &claim.point,
           );
@@ -908,10 +969,10 @@ impl Dag {
       let dense_results: Vec<_> = dense_tasks
         .iter()
         .map(|(e, claim)| {
-          let w = witnesses[*e][0];
+          let w = &witnesses[*e][0];
           let proof = DP::open(
-            &dense_commitments[*e].as_ref().unwrap(),
-            &w.data.as_ref().unwrap().as_any().downcast_ref::<DenseMLPoly<F>>().unwrap(),
+            dense_commitments[*e].as_ref().unwrap(),
+            w.data.as_ref().unwrap().as_any().downcast_ref::<DenseMLPoly<F>>().unwrap(),
             dense_key,
             &claim.point,
           );
@@ -919,7 +980,6 @@ impl Dag {
         })
         .collect();
 
-      // Compute sparse openings in parallel (arkworks) or sequentially (icicle)
       #[cfg(feature = "arkworks")]
       let sparse_results: Vec<_> = sparse_tasks
         .par_iter()
@@ -939,10 +999,10 @@ impl Dag {
       let sparse_results: Vec<_> = sparse_tasks
         .iter()
         .map(|(e, claim)| {
-          let w = witnesses[*e][claim.sparse_id];
+          let w = &witnesses[*e][claim.sparse_id];
           let proof = SP::open(
             &sparse_commitments[*e].as_ref().unwrap()[claim.sparse_id],
-            &w.data.as_ref().unwrap().as_any().downcast_ref::<SparseMLPoly<F>>().unwrap(),
+            w.data.as_ref().unwrap().as_any().downcast_ref::<SparseMLPoly<F>>().unwrap(),
             sparse_key,
             &claim.point,
           );
@@ -950,12 +1010,10 @@ impl Dag {
         })
         .collect();
 
-      // Store dense results
       for (e, proof) in dense_results {
         edge_proofs[e].dense_opening_proof.push(proof);
       }
 
-      // Store sparse results
       for (e, proof) in sparse_results {
         edge_proofs[e].sparse_opening_proof.push(proof);
       }
@@ -989,6 +1047,46 @@ impl Dag {
     DP::Commitment: Sync,
     SP::Commitment: Sync,
   {
+    if node_proofs.len() != self.nodes.len()
+      || edge_proofs.len() != self.num_edges
+      || reducer_proofs.len() != self.nodes.len()
+      || witnesses.len() != self.num_edges
+      || dense_commitments.len() != self.num_edges
+      || sparse_commitments.len() != self.num_edges
+    {
+      return false;
+    }
+
+    for e in 0..self.num_edges {
+      if witnesses[e].is_empty() {
+        return false;
+      }
+      let expected_sparse = self.is_sparse_aux_edge(e);
+      if expected_sparse && witnesses[e][0].poly_type != PolyType::Sparse {
+        return false;
+      }
+      if !expected_sparse && (witnesses[e][0].poly_type != PolyType::Dense || witnesses[e].len() != 1) {
+        return false;
+      }
+      if self.is_advice_output_edge(e) && witnesses[e][0].role != Role::Auxiliary {
+        return false;
+      }
+    }
+
+    let committed_edge_ids: Vec<EdgeId> = (0..self.num_edges)
+      .filter(|&e| !witnesses[e].is_empty() && self.should_commit(&witnesses[e][0], e))
+      .collect();
+
+    for &e in &committed_edge_ids {
+      if witnesses[e][0].poly_type == PolyType::Dense {
+        if dense_commitments[e].is_none() {
+          return false;
+        }
+      } else if sparse_commitments[e].as_ref().map_or(true, |cs| cs.len() != witnesses[e].len()) {
+        return false;
+      }
+    }
+
     // Absorb all polynomial commitments into Fiat-Shamir transcript (must match prover)
     for comm in dense_commitments.iter() {
       if let Some(c) = comm {
@@ -1005,24 +1103,42 @@ impl Dag {
 
     let reducer = BasicBlockType::Reducer(Reducer {});
     let mut verified = true;
-    let irreducable_edge_ids: Vec<EdgeId> =
-      (0..self.num_edges).filter(|&e| self.producers[e].is_none() || witnesses[e][0].role == Role::Auxiliary).collect();
 
     let mut claims: Vec<Vec<Claim<F>>> = Vec::with_capacity(self.num_edges);
     claims.resize_with(self.num_edges, || Vec::new());
     let mut nodes_to_verify = BTreeSet::new();
-    self.output_ports.iter().for_each(|&e| {
-      let w = &witnesses[e][0];
-      if w.role == Role::Output {
-        let point: Vec<F> = (0..edge_proofs[e].claims[0].point.len()).map(|_| transcript.challenge_scalar(b"challenge")).collect();
-        verified = verified && edge_proofs[e].claims[0].point == point;
-        claims[e].push(edge_proofs[e].claims[0].clone());
-        nodes_to_verify.insert(self.producers[e].unwrap());
+    for &e in &self.output_ports {
+      if witnesses[e].is_empty() {
+        return false;
       }
-    });
+      let w = &witnesses[e][0];
+      let is_active_output = w.poly_type == PolyType::Dense && (w.role == Role::Output || !self.consumers[e].is_empty());
+      if !is_active_output {
+        continue;
+      }
+      if claims[e].is_empty() {
+        let expected_n = get_n(&w.shape);
+        if edge_proofs[e].claims.is_empty() {
+          return false;
+        }
+        let c0 = &edge_proofs[e].claims[0];
+        if c0.edge_id != e || c0.sparse_id != 0 || c0.point.len() != expected_n {
+          return false;
+        }
+        let point: Vec<F> = (0..expected_n).map(|_| transcript.challenge_scalar(b"challenge")).collect();
+        if c0.point != point {
+          return false;
+        }
+        transcript.append_scalar(b"output_claim_eval", &c0.eval);
+        claims[e].push(c0.clone());
+      }
+      if let Some(prod) = self.producers[e] {
+        nodes_to_verify.insert(prod);
+      }
+    }
 
     let mut preserve_nodes = BTreeSet::new();
-    // Pre-compute consumer sets for faster lookups
+    let mut visited_nodes = BTreeSet::new();
     let consumer_sets: Vec<BTreeSet<NodeId>> = self.consumers.iter().map(|consumers| consumers.iter().copied().collect()).collect();
 
     let start = std::time::Instant::now();
@@ -1039,34 +1155,90 @@ impl Dag {
         nodes_to_verify.insert(u);
         continue;
       }
+      visited_nodes.insert(u);
       let node = &self.nodes[u];
 
-      let (local_sumcheck_proofs, local_claims) = node_proofs[u].as_ref().unwrap();
-      let local_claims: Vec<&Claim<F>> = local_claims.iter().collect();
-      let local_witnesses: Vec<&Witness<F>> = local_claims.iter().map(|&c| &witnesses[c.edge_id][0]).collect();
-      let local_sumcheck_proofs: Vec<&SumcheckProof<F>> = local_sumcheck_proofs.iter().collect();
+      let Some((local_sumcheck_proofs_vec, local_claims_vec)) = node_proofs[u].as_ref() else {
+        return false;
+      };
+      let expected_in_edges: Vec<EdgeId> = match &node.kind {
+        BasicBlockType::TwoPow(_)
+        | BasicBlockType::RMSReciprocal(_)
+        | BasicBlockType::Reciprocal(_)
+        | BasicBlockType::DivConst(_)
+        | BasicBlockType::SoftmaxConst(_)
+        | BasicBlockType::SigmoidConst(_) => vec![],
+        BasicBlockType::NonStructuredExp(_) => vec![node.inputs[1], node.outputs[1]],
+        BasicBlockType::NonNegative(_) | BasicBlockType::ZeroCheck(_) => return false,
+        _ => node.inputs.clone(),
+      };
 
-      if claims[node.outputs[0]].len() > 1 {
+      if local_claims_vec.len() != expected_in_edges.len() + 1 {
+        return false;
+      }
+      for (slot, &exp_edge) in expected_in_edges.iter().enumerate() {
+        if local_claims_vec[slot].edge_id != exp_edge || local_claims_vec[slot].sparse_id != 0 {
+          return false;
+        }
+      }
+      let out_claim_in_node = &local_claims_vec[expected_in_edges.len()];
+      if out_claim_in_node.edge_id != node.outputs[0] || out_claim_in_node.sparse_id != 0 {
+        return false;
+      }
+
+      let mut out_claims_accum: Vec<Claim<F>> = Vec::new();
+      for &e in &node.outputs {
+        out_claims_accum.extend(claims[e].iter().cloned());
+      }
+      if out_claims_accum.is_empty() {
+        return false;
+      }
+
+      if out_claims_accum.len() == 1 {
+        if reducer_proofs[u].is_some()
+          || out_claim_in_node.edge_id != out_claims_accum[0].edge_id
+          || out_claim_in_node.sparse_id != out_claims_accum[0].sparse_id
+          || out_claim_in_node.point != out_claims_accum[0].point
+          || out_claim_in_node.eval != out_claims_accum[0].eval
+        {
+          println!("=== output claim chaining mismatch for node {u} ===");
+          return false;
+        }
+      } else {
         println!("verifying reducer for node {u} | kind {:?}", self.nodes[u].kind);
-        assert!(reducer_proofs[u].is_some(), "reducer proof is not found for node {u}");
+        let Some(red_proofs_vec) = reducer_proofs[u].as_ref() else {
+          return false;
+        };
         let reducer_witness = vec![&witnesses[node.outputs[0]][0]];
-        let mut reducer_claims = claims[node.outputs[0]].clone();
-        reducer_claims.push(local_claims[local_claims.len() - 1].clone());
-        let reducer_claims: Vec<&Claim<F>> = reducer_claims.iter().collect();
-        let reducer_sumcheck_proofs: Vec<&SumcheckProof<F>> = reducer_proofs[u].as_ref().unwrap().iter().collect();
-        let reducer_verified = reducer.verify(&reducer_witness, &reducer_claims, &reducer_sumcheck_proofs, transcript);
+        let mut reducer_claims = out_claims_accum;
+        reducer_claims.push(out_claim_in_node.clone());
+        let reducer_claims_refs: Vec<&Claim<F>> = reducer_claims.iter().collect();
+        let reducer_sumcheck_proofs: Vec<&SumcheckProof<F>> = red_proofs_vec.iter().collect();
+        let reducer_verified = reducer.verify(&reducer_witness, &reducer_claims_refs, &reducer_sumcheck_proofs, transcript);
         verified = verified && reducer_verified;
         if !reducer_verified {
           println!("=== verified reducer for node {u}: {reducer_verified} ===");
+          return false;
         }
+        // Mirror `prove` line 817 so committed auxiliary outputs record the reduced claim
+        claims[node.outputs[0]].push(out_claim_in_node.clone());
       }
+
+      let local_claims: Vec<&Claim<F>> = local_claims_vec.iter().collect();
+      let local_witnesses: Vec<&Witness<F>> = local_claims.iter().map(|&c| &witnesses[c.edge_id][0]).collect();
+      let local_sumcheck_proofs: Vec<&SumcheckProof<F>> = local_sumcheck_proofs_vec.iter().collect();
 
       println!("verifying node {u} | kind {:?}", self.nodes[u].kind);
       let node_verified = self.nodes[u].kind.verify(&local_witnesses, &local_claims, &local_sumcheck_proofs, transcript);
       if !node_verified {
         println!("=== verified node {u}: {node_verified} ===");
+        return false;
       }
       verified = verified && node_verified;
+
+      for c in &local_claims_vec[..expected_in_edges.len()] {
+        transcript.append_scalar(b"node_claim_eval", &c.eval);
+      }
 
       for &e in &node.inputs {
         if let Some(producer) = self.producers[e] {
@@ -1074,26 +1246,23 @@ impl Dag {
         }
       }
 
-      // Avoid expensive union + collect by extending in-place
       for &preserve_node in &preserve_nodes {
         nodes_to_verify.insert(preserve_node);
       }
       preserve_nodes.clear();
 
-      local_claims.iter().for_each(|&c| {
-        if node.inputs.contains(&c.edge_id) {
-          claims[c.edge_id].push(c.clone())
-        }
-      });
+      for c in &local_claims_vec[..expected_in_edges.len()] {
+        claims[c.edge_id].push(c.clone());
+      }
     }
     let end = start.elapsed();
     println!("time taken to verify nodes: {:?}", end);
 
-    // verify the range proof and two_pow proof
+    // verify the two_pow, range, and zero_check proofs
     let start = std::time::Instant::now();
-    let two_pow_verified = self.verify_two_pow(node_proofs, witnesses, two_pow_proof, transcript);
-    let range_verified = self.verify_range(node_proofs, witnesses, range_proof, transcript);
-    let zero_check_verified = self.verify_zero_check(node_proofs);
+    let two_pow_verified = self.verify_two_pow(witnesses, edge_proofs, &mut claims, two_pow_proof, transcript);
+    let range_verified = self.verify_range(node_proofs, witnesses, edge_proofs, &visited_nodes, &mut claims, range_proof, transcript);
+    let zero_check_verified = self.verify_zero_check(node_proofs, &claims);
     let end = start.elapsed();
     println!("time taken to verify two_pow and range: {:?}", end);
     if !two_pow_verified {
@@ -1106,33 +1275,62 @@ impl Dag {
       println!("=== verified zero_check: {zero_check_verified} ===");
     }
     verified = verified && range_verified && two_pow_verified && zero_check_verified;
+    if !verified {
+      return false;
+    }
 
-    // verify the irreducible edges (opening proofs) - fully parallelized
+    // verify all committed edges (exact claim binding + opening proofs) - fully parallelized
     let start = std::time::Instant::now();
-    let opening_verified = irreducable_edge_ids.par_iter().all(|&e| {
+    let opening_verified = committed_edge_ids.par_iter().all(|&e| {
+      if edge_proofs[e].claims.len() != claims[e].len() {
+        println!(
+          "claim count mismatch for edge {e}: edge_proofs has {}, expected {}",
+          edge_proofs[e].claims.len(),
+          claims[e].len()
+        );
+        return false;
+      }
+      for i in 0..claims[e].len() {
+        let got = &edge_proofs[e].claims[i];
+        let exp = &claims[e][i];
+        if got.edge_id != exp.edge_id || got.sparse_id != exp.sparse_id || got.point != exp.point || got.eval != exp.eval {
+          println!("claim mismatch for edge {e} claim {i}");
+          return false;
+        }
+      }
       if witnesses[e][0].poly_type == PolyType::Dense {
-        (0..edge_proofs[e].claims.len()).into_par_iter().all(|i| {
+        if edge_proofs[e].dense_opening_proof.len() != claims[e].len() || !edge_proofs[e].sparse_opening_proof.is_empty() {
+          return false;
+        }
+        (0..claims[e].len()).into_par_iter().all(|i| {
           let (ok, opened_eval) = DP::verify_and_extract(
             dense_commitments[e].as_ref().unwrap(),
             &edge_proofs[e].dense_opening_proof[i],
             dense_key,
-            &edge_proofs[e].claims[i].point,
+            &claims[e][i].point,
           );
-          if ok && opened_eval != edge_proofs[e].claims[i].eval {
+          if ok && opened_eval != claims[e][i].eval {
             println!("opening eval mismatch for dense edge {e} claim {i}");
             return false;
           }
           ok
         })
       } else {
-        (0..edge_proofs[e].claims.len()).into_par_iter().all(|i| {
+        if edge_proofs[e].sparse_opening_proof.len() != claims[e].len() || !edge_proofs[e].dense_opening_proof.is_empty() {
+          return false;
+        }
+        let comms = sparse_commitments[e].as_ref().unwrap();
+        (0..claims[e].len()).into_par_iter().all(|i| {
+          if claims[e][i].sparse_id >= comms.len() {
+            return false;
+          }
           let (ok, opened_eval) = SP::verify_and_extract(
-            &sparse_commitments[e].as_ref().unwrap()[edge_proofs[e].claims[i].sparse_id],
+            &comms[claims[e][i].sparse_id],
             &edge_proofs[e].sparse_opening_proof[i],
             sparse_key,
-            &edge_proofs[e].claims[i].point,
+            &claims[e][i].point,
           );
-          if ok && opened_eval != edge_proofs[e].claims[i].eval {
+          if ok && opened_eval != claims[e][i].eval {
             println!("opening eval mismatch for sparse edge {e} claim {i}");
             return false;
           }
@@ -1145,35 +1343,54 @@ impl Dag {
     verified && opening_verified
   }
 
-  /// Verifies that every ZeroCheck node's input-edge claim evaluates to zero.
-  /// By Schwartz–Zippel (point drawn fresh in `output_ports` loop) this is
-  /// sufficient to conclude the underlying polynomial is identically zero.
+  /// Verifies that every ZeroCheck node's input-edge claim matches the accumulated
+  /// output-port claim on `node.inputs[0]` and evaluates to zero.
   pub fn verify_zero_check<F: CryptoField + 'static>(
     &self,
     node_proofs: &[Option<(Vec<SumcheckProof<F>>, Vec<Claim<F>>)>],
+    accum_claims: &[Vec<Claim<F>>],
   ) -> bool {
     for &nid in &self.zero_check {
-      let Some((_, claims)) = node_proofs[nid].as_ref() else {
+      let in_edge = self.nodes[nid].inputs[0];
+      let Some((sc_proofs, sink_claims)) = node_proofs[nid].as_ref() else {
         println!("zero_check: missing node_proof for node {nid}");
         return false;
       };
-      if claims.len() != 1 || claims[0].eval != <F as CryptoField>::zero() {
-        println!("zero_check: non-zero eval for node {nid}");
+      if !sc_proofs.is_empty() || sink_claims.len() != 1 || accum_claims[in_edge].is_empty() {
+        return false;
+      }
+      let exp = &accum_claims[in_edge][0];
+      if sink_claims[0].edge_id != in_edge
+        || sink_claims[0].point != exp.point
+        || sink_claims[0].eval != exp.eval
+        || sink_claims[0].eval != <F as CryptoField>::zero()
+      {
+        println!("zero_check: invalid or non-zero eval for node {nid}");
         return false;
       }
     }
     true
   }
 
-  pub fn verify_range<F: CryptoField + 'static>(
+  pub fn verify_range<F, DP, SP>(
     &self,
     node_proofs: &[Option<(Vec<SumcheckProof<F>>, Vec<Claim<F>>)>],
     witnesses: &[Vec<Witness<F>>],
+    edge_proofs: &[EdgeProof<F, DP, SP>],
+    visited_nodes: &BTreeSet<NodeId>,
+    claims: &mut Vec<Vec<Claim<F>>>,
     range_proof: &LookupProof<F>,
     transcript: &mut Transcript<F>,
-  ) -> bool {
-    if self.range.len() == 0 {
-      return true;
+  ) -> bool
+  where
+    F: CryptoField + 'static,
+    DP: MLPolyCommit<F, DenseMLPoly<F>>,
+    SP: MLPolyCommit<F, SparseMLPoly<F>>,
+  {
+    if self.range.is_empty() {
+      return range_proof.table_proofs.is_empty()
+        && range_proof.middle_claims.is_empty()
+        && range_proof.bool_proofs.is_empty();
     }
     println!("verifying range");
 
@@ -1181,90 +1398,227 @@ impl Dag {
     let range_middle_claims = &range_proof.middle_claims;
     let range_bool_proofs = &range_proof.bool_proofs;
 
+    if range_middle_claims.len() != self.range.len() {
+      return false;
+    }
+
+    struct RangeBlockMeta<F> {
+      range_idx: usize,
+      aux_edge: EdgeId,
+      sparse_id: usize,
+      table_vars: usize,
+      inp_point: Vec<F>,
+    }
+    let mut blocks_meta: Vec<RangeBlockMeta<F>> = Vec::new();
+    let mut max_blocks = 1usize;
+
+    for (i, &n) in self.range.iter().enumerate() {
+      let node = &self.nodes[n];
+      let aux_id = if matches!(node.kind, BasicBlockType::NonNegative(_)) { 0 } else { 1 };
+      let aux_edge = node.outputs[aux_id];
+      let num_blocks = witnesses[aux_edge].len();
+      let total_bits = self.range_node_total_bits(n);
+      let expected_split_blocks = if total_bits == 0 {
+        1
+      } else {
+        (total_bits + *TABLE_COMMIT_LOG - 1) / *TABLE_COMMIT_LOG
+      };
+      if num_blocks == 0 || (num_blocks != 1 && num_blocks != expected_split_blocks) {
+        return false;
+      }
+      if range_middle_claims[i].len() != num_blocks {
+        return false;
+      }
+      max_blocks = max_blocks.max(num_blocks);
+
+      let Some((sc_proofs, node_claim)) = node_proofs[n].as_ref() else {
+        return false;
+      };
+      let expected_inp_n = get_n(&witnesses[node.inputs[0]][0].shape);
+      if matches!(node.kind, BasicBlockType::NonNegative(_)) {
+        let in_edge = node.inputs[0];
+        if !sc_proofs.is_empty() || node_claim.len() != 1 || claims[in_edge].is_empty() {
+          return false;
+        }
+        let exp = &claims[in_edge][0];
+        if node_claim[0].edge_id != in_edge
+          || node_claim[0].point != exp.point
+          || node_claim[0].eval != exp.eval
+          || node_claim[0].point.len() != expected_inp_n
+        {
+          return false;
+        }
+      } else if !visited_nodes.contains(&n) || node_claim.len() != 2 || node_claim[0].point.len() != expected_inp_n {
+        return false;
+      }
+
+      for sparse_id in 0..num_blocks {
+        let table_vars = self.range_block_table_vars(n, num_blocks, sparse_id);
+        blocks_meta.push(RangeBlockMeta {
+          range_idx: i,
+          aux_edge,
+          sparse_id,
+          table_vars,
+          inp_point: node_claim[0].point.clone(),
+        });
+      }
+    }
+
+    // Absorb `range_middle_claims` BEFORE squeezing challenges (fixes adaptive Fiat-Shamir forgery)
+    for mc in range_middle_claims {
+      for &m in mc {
+        transcript.append_scalar(b"range_middle_claim", &m);
+      }
+    }
+
     let alpha: F = transcript.challenge_scalar(b"table_alpha");
-    let alphas = calc_pow(alpha, 2);
     let beta: F = transcript.challenge_scalar(b"table_beta");
     let betas = calc_pow(beta, self.range.len());
     let gamma: F = transcript.challenge_scalar(b"table_gamma");
-    let max_blocks = self.range.iter().map(|n| {
-      let node = &self.nodes[*n];
-      let aux_id = if matches!(node.kind, BasicBlockType::NonNegative(_)) { 0 } else { 1 };
-      witnesses[node.outputs[aux_id]].len()
-    }).max().unwrap_or(8);
     let gammas = calc_pow(gamma, max_blocks);
 
-    let mut table_expected_sum = <F as CryptoField>::zero();
-    for (i, n) in self.range.iter().enumerate() {
-      println!("verifying range for node {n} | kind {:?}", self.nodes[*n].kind);
-      let node = &self.nodes[*n];
+    for (i, &n) in self.range.iter().enumerate() {
+      println!("verifying range for node {n} | kind {:?}", self.nodes[n].kind);
+      let node = &self.nodes[n];
       let aux_id = if matches!(node.kind, BasicBlockType::NonNegative(_)) { 0 } else { 1 };
       let auxs = &witnesses[node.outputs[aux_id]];
-      let node_claim = &node_proofs[*n].as_ref().unwrap().1;
+      let node_claim = &node_proofs[n].as_ref().unwrap().1;
       let eval_to_check = if matches!(node.kind, BasicBlockType::ScaleDown(_)) {
         let input_sf = witnesses[node.inputs[0]][0].sf;
         let output_sf = witnesses[node.outputs[0]][0].sf;
-        let rescale_factor = 1 << (input_sf - output_sf);
-        let rescale_factor_divided_by_2 = rescale_factor / 2;
-        let rescale_factor_f = F::from(rescale_factor as u32);
-        let rescale_factor_divided_by_2_f = F::from(rescale_factor_divided_by_2 as u32);
+        let shift = input_sf - output_sf;
+        if shift >= 127 {
+          return false;
+        }
+        let rescale_factor: i128 = 1i128 << shift;
+        let rescale_factor_divided_by_2: i128 = rescale_factor / 2;
+        let rescale_factor_f = F::from(rescale_factor);
+        let rescale_factor_divided_by_2_f = F::from(rescale_factor_divided_by_2);
         node_claim[0].eval - node_claim[1].eval * rescale_factor_f + rescale_factor_divided_by_2_f
       } else if matches!(node.kind, BasicBlockType::ScaleUp(_)) {
         let input_sf = witnesses[node.inputs[0]][0].sf;
         let output_sf = witnesses[node.outputs[0]][0].sf;
-        let rescale_factor = 1 << (output_sf - input_sf);
-        let rescale_factor_divided_by_2 = rescale_factor / 2;
-        let rescale_factor_f = F::from(rescale_factor as u32);
-        let rescale_factor_divided_by_2_f = F::from(rescale_factor_divided_by_2 as u32);
+        let shift = output_sf - input_sf;
+        if shift >= 127 {
+          return false;
+        }
+        let rescale_factor: i128 = 1i128 << shift;
+        let rescale_factor_divided_by_2: i128 = rescale_factor / 2;
+        let rescale_factor_f = F::from(rescale_factor);
+        let rescale_factor_divided_by_2_f = F::from(rescale_factor_divided_by_2);
         node_claim[0].eval * rescale_factor_f - node_claim[1].eval + rescale_factor_divided_by_2_f
       } else if matches!(node.kind, BasicBlockType::ExpHelper(_)) {
         let cache = get_cached_inverses::<F>();
         (node_claim[0].eval - node_claim[1].eval) * cache.neg_ln2_inv
       } else {
-        // NonNegative
         node_claim[0].eval
       };
-      let mut eval_acc = <F as CryptoField>::zero();
 
-      for (sparse_id, _aux) in auxs.iter().enumerate() {
+      let mut eval_acc = <F as CryptoField>::zero();
+      for sparse_id in 0..auxs.len() {
+        let shift = sparse_id.saturating_mul(*TABLE_COMMIT_LOG);
+        if shift >= 127 {
+          return false;
+        }
         let middle_sum = range_middle_claims[i][sparse_id];
-        eval_acc += middle_sum * F::from(1 << (sparse_id * *TABLE_COMMIT_LOG) as u32);
-        let beta_gamma = betas[i] * gammas[sparse_id];
-        table_expected_sum += (middle_sum + alphas[1]) * beta_gamma;
+        eval_acc += middle_sum * F::from(1i128 << shift);
       }
       if eval_to_check != eval_acc {
         println!("range eval_to_check mismatch for node {n} | kind {:?} | #auxs {}", node.kind, auxs.len());
         return false;
       }
     }
-    // verify the table proof
-    let mut sumcheck_verifier = SumcheckVerifier::new(range_table_proofs[0].round_messages.len(), 2, transcript);
-    let (verification_result, _challenges) = sumcheck_verifier.verify(transcript, range_table_proofs[0].round_messages.clone(), table_expected_sum);
-    if verification_result.is_none() {
-      println!("range table proof verification failed");
+
+    // Group blocks deterministically by `table_vars` and `aux_num_var`
+    let mut table_groups: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    let mut bool_groups: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for (b_idx, meta) in blocks_meta.iter().enumerate() {
+      table_groups.entry(meta.table_vars).or_default().push(b_idx);
+      bool_groups.entry(meta.inp_point.len() + meta.table_vars).or_default().push(b_idx);
+    }
+
+    if range_table_proofs.len() != table_groups.len() || range_bool_proofs.len() != bool_groups.len() {
       return false;
     }
 
-    // verify the bool proofs (from GeneralLinearSumcheckProver)
-    // Each bool proof corresponds to a group of auxiliary polynomials with the same num_var
-    // We can determine aux_num_var directly from the proof's round_messages.len()
-    for bool_proof in range_bool_proofs.iter() {
-      // aux_num_var equals the number of sumcheck rounds
-      let aux_num_var = bool_proof.round_messages.len();
+    // Verify each table sumcheck proof AND its terminal evaluation against opened sparse claims
+    for (group_idx, (&table_vars, block_idxs)) in table_groups.iter().enumerate() {
+      let mut group_expected_sum = <F as CryptoField>::zero();
+      for &b_idx in block_idxs {
+        let meta = &blocks_meta[b_idx];
+        let mid = range_middle_claims[meta.range_idx][meta.sparse_id];
+        group_expected_sum += (mid + alpha) * betas[meta.range_idx] * gammas[meta.sparse_id];
+      }
 
-      // Create verifier with same parameters as prover
+      let mut sumcheck_verifier = SumcheckVerifier::new(table_vars, 2, transcript);
+      let (verification_result, r_tbl) =
+        sumcheck_verifier.verify(transcript, range_table_proofs[group_idx].round_messages.clone(), group_expected_sum);
+      let Some(running_sum) = verification_result else {
+        println!("range table proof verification failed");
+        return false;
+      };
+
+      let mut group_aux_eval = <F as CryptoField>::zero();
+      for &b_idx in block_idxs {
+        let meta = &blocks_meta[b_idx];
+        let claim_idx = claims[meta.aux_edge].len();
+        if claim_idx >= edge_proofs[meta.aux_edge].claims.len() {
+          return false;
+        }
+        let c = &edge_proofs[meta.aux_edge].claims[claim_idx];
+        let expected_point: Vec<F> = meta.inp_point.iter().chain(r_tbl.iter()).cloned().collect();
+        if c.edge_id != meta.aux_edge || c.sparse_id != meta.sparse_id || c.point != expected_point {
+          return false;
+        }
+        transcript.append_scalar(b"range_table_eval", &c.eval);
+        group_aux_eval += betas[meta.range_idx] * gammas[meta.sparse_id] * c.eval;
+        claims[meta.aux_edge].push(c.clone());
+      }
+
+      let range_eval = alpha + evaluate_range_structured(&r_tbl);
+      if running_sum != group_aux_eval * range_eval {
+        println!("range table proof terminal evaluation mismatch");
+        return false;
+      }
+    }
+
+    // Verify each booleanity sumcheck proof AND its terminal evaluation against opened sparse claims
+    let one = <F as CryptoField>::one();
+    for (group_idx, (&aux_num_var, block_idxs)) in bool_groups.iter().enumerate() {
       let mut bool_verifier = SumcheckVerifier::new(aux_num_var, 3, transcript);
-
-      // Generate the same challenges for eq polynomial (before sumcheck)
-      let _challenge: Vec<F> = (0..aux_num_var).map(|_| transcript.challenge_scalar(b"challenge")).collect();
-
-      // The expected sum for boolean proof is 0: Σ_x eq(r,x) * Σ_j (beta_gamma_j * (aux_j(x)-1) * aux_j(x) * beta_gamma_j) = 0
-      // because aux_j(x) * (aux_j(x) - 1) = 0 when aux_j is boolean
+      let eq_challenge: Vec<F> = (0..aux_num_var).map(|_| transcript.challenge_scalar(b"challenge")).collect();
       let expected_sum = <F as CryptoField>::zero();
-
-      // Verify the sumcheck proof
-      let (verification_result, _challenges) = bool_verifier.verify(transcript, bool_proof.round_messages.clone(), expected_sum);
-      if verification_result.is_none() {
+      let (verification_result, r_bool) =
+        bool_verifier.verify(transcript, range_bool_proofs[group_idx].round_messages.clone(), expected_sum);
+      let Some(running_sum) = verification_result else {
         println!("bool proof verification failed for aux_num_var {}", aux_num_var);
+        return false;
+      };
+
+      let mut inner_bool = <F as CryptoField>::zero();
+      for &b_idx in block_idxs {
+        let meta = &blocks_meta[b_idx];
+        let claim_idx = claims[meta.aux_edge].len();
+        if claim_idx >= edge_proofs[meta.aux_edge].claims.len() {
+          return false;
+        }
+        let c = &edge_proofs[meta.aux_edge].claims[claim_idx];
+        if c.edge_id != meta.aux_edge || c.sparse_id != meta.sparse_id || c.point != r_bool {
+          return false;
+        }
+        transcript.append_scalar(b"range_bool_eval", &c.eval);
+        let bg = betas[meta.range_idx] * gammas[meta.sparse_id];
+        let w = bg * bg;
+        inner_bool += w * c.eval * (c.eval - one);
+        claims[meta.aux_edge].push(c.clone());
+      }
+
+      let eq_eval = eq_challenge
+        .iter()
+        .zip(r_bool.iter())
+        .fold(one, |acc, (&ec, &rb)| acc * (rb * ec + (one - rb) * (one - ec)));
+      if running_sum != eq_eval * inner_bool {
+        println!("bool proof terminal evaluation mismatch for aux_num_var {}", aux_num_var);
         return false;
       }
     }
@@ -1283,101 +1637,153 @@ impl Dag {
     let mut table_proofs = Vec::new();
     let mut bool_proofs = Vec::new();
     let mut middle_claims: Vec<Vec<F>> = vec![vec![]; self.range.len()];
-    // prove range
-    if self.range.len() > 0 {
+    if !self.range.is_empty() {
       println!("proving range");
       timed!(timing, "prove range", {
-        let alpha: F = transcript.challenge_scalar(b"table_alpha");
-        let alphas = calc_pow(alpha, 2);
-        let beta: F = transcript.challenge_scalar(b"table_beta");
-        let betas = calc_pow(beta, self.range.len());
-        let gamma: F = transcript.challenge_scalar(b"table_gamma");
-        let max_blocks = self.range.iter().map(|n| {
-          let node = &self.nodes[*n];
-          let aux_id = if matches!(node.kind, BasicBlockType::NonNegative(_)) { 0 } else { 1 };
-          witnesses[node.outputs[aux_id]].len()
-        }).max().unwrap_or(8);
-        let gammas = calc_pow(gamma, max_blocks);
-        let mut aux_polys = Vec::new();
-        // Sparse bool proof data: group by aux_num_var → (weights β², sparse positions, node indices)
-        let mut bool_hashmap: BTreeMap<usize, (Vec<F>, Vec<Vec<usize>>, Vec<(usize, usize, usize)>)> = BTreeMap::new();
-        for (i, n) in self.range.iter().enumerate() {
-          let node = &self.nodes[*n];
-          let aux_id = if matches!(node.kind, BasicBlockType::NonNegative(_)) { 0 } else { 1 };
-          // Use the node's own claim from its sumcheck, not the input edge's last claim
-          let inp_claim = &node_proofs[*n].as_ref().unwrap().1[0];
-          let lagrange_basis = evaluate_lagrange_basis(&inp_claim.point);
-          let auxs = &witnesses[node.outputs[aux_id]];
-          for (sparse_id, aux) in auxs.iter().enumerate() {
-            let beta_gamma = betas[i] * gammas[sparse_id];
-            let aux_poly = aux.data.as_ref().unwrap().as_any().downcast_ref::<SparseMLPoly<F>>().unwrap();
-            // collect sparse positions for boolean proof (avoid to_dense)
-            let aux_num_var = aux_poly.n();
-            let positions: Vec<usize> = aux_poly.evaluations.keys().copied().collect();
-            if !bool_hashmap.contains_key(&aux_num_var) {
-              bool_hashmap.insert(aux_num_var, (Vec::new(), Vec::new(), Vec::new()));
-            }
-            let (bool_weights, bool_positions, bool_indices) = bool_hashmap.get_mut(&aux_num_var).unwrap();
-            bool_weights.push(beta_gamma * beta_gamma);
-            bool_positions.push(positions);
-            bool_indices.push((*n, aux_id, sparse_id));
-            // prove Shout
-            let mut part_aux_poly_evals = vec![<F as CryptoField>::zero(); 1 << (aux_poly.n() - inp_claim.point.len())];
-            let mut hs = HashSet::new();
-            aux_poly.selection.selection.iter().for_each(|(input_idx, table_idx)| {
-              hs.insert(*table_idx);
-              part_aux_poly_evals[*table_idx] += lagrange_basis[*input_idx];
-            });
-            middle_claims[i].push(part_aux_poly_evals.par_iter().enumerate().map(|(idx, val)| *val * F::from(idx as u32)).sum::<F>());
+        struct RangeBlockProverData<F> {
+          range_idx: usize,
+          aux_edge: EdgeId,
+          sparse_id: usize,
+          table_vars: usize,
+          inp_point: Vec<F>,
+          part_evals: Vec<F>,
+        }
+        let mut blocks_data: Vec<RangeBlockProverData<F>> = Vec::new();
+        let mut max_blocks = 1usize;
 
-            hs.iter().for_each(|idx| {
-              part_aux_poly_evals[*idx] *= beta_gamma;
+        for (i, &n) in self.range.iter().enumerate() {
+          let node = &self.nodes[n];
+          let aux_id = if matches!(node.kind, BasicBlockType::NonNegative(_)) { 0 } else { 1 };
+          let aux_edge = node.outputs[aux_id];
+          let inp_claim = &node_proofs[n].as_ref().unwrap().1[0];
+          let d = inp_claim.point.len();
+          let mask = if d == 0 { 0 } else { (1usize << d) - 1 };
+          let lagrange_basis = evaluate_lagrange_basis(&inp_claim.point);
+          let auxs = &witnesses[aux_edge];
+          let num_blocks = auxs.len();
+          max_blocks = max_blocks.max(num_blocks);
+
+          for (sparse_id, aux) in auxs.iter().enumerate() {
+            let table_vars = self.range_block_table_vars(n, num_blocks, sparse_id);
+            let aux_poly = aux.data.as_ref().unwrap().as_any().downcast_ref::<SparseMLPoly<F>>().unwrap();
+            debug_assert_eq!(aux_poly.n(), d + table_vars);
+
+            let mut part_evals = vec![<F as CryptoField>::zero(); 1usize << table_vars];
+            for (&full_idx, &val) in &aux_poly.evaluations {
+              let input_idx = full_idx & mask;
+              let table_idx = full_idx >> d;
+              part_evals[table_idx] += val * lagrange_basis[input_idx];
+            }
+
+            let mid = part_evals
+              .iter()
+              .enumerate()
+              .fold(<F as CryptoField>::zero(), |acc, (idx, &val)| acc + val * F::from(idx as u32));
+            middle_claims[i].push(mid);
+
+            blocks_data.push(RangeBlockProverData {
+              range_idx: i,
+              aux_edge,
+              sparse_id,
+              table_vars,
+              inp_point: inp_claim.point.clone(),
+              part_evals,
             });
-            let part_aux_poly = DenseMLPoly::new(aux_poly.n() - inp_claim.point.len(), part_aux_poly_evals);
-            aux_polys.push(part_aux_poly);
           }
         }
 
-        let aux_poly = aux_polys[1..aux_polys.len()].iter().fold(aux_polys[0].clone(), |acc, x| acc.add(x));
-        let range_poly = range_dense::<F>(aux_poly.n()).add_by_scalar(alphas[1]);
-        let mut sumcheck_prover = LinearSumcheckProver::<F>::new(range_poly.n(), 2, transcript);
-        let sumcheck_proof = sumcheck_prover.prove(&vec![aux_poly, range_poly], transcript);
-        table_proofs.push(sumcheck_proof);
-
-        bool_hashmap.iter().for_each(|(aux_num_var, (bool_weights, bool_positions, bool_indices))| {
-          let mut bool_prover = SparseBoolSumcheckProver::<F>::new(*aux_num_var, transcript);
-          let challenge: Vec<F> = (0..*aux_num_var).map(|_| transcript.challenge_scalar(b"challenge")).collect();
-          let bool_proof = bool_prover.prove(bool_weights, bool_positions, &challenge, transcript);
-          bool_proofs.push(bool_proof);
-          for (n, aux_id, sparse_id) in bool_indices.iter() {
-            let node = &self.nodes[*n];
-            let bool_claim = Claim {
-              edge_id: node.outputs[*aux_id],
-              sparse_id: *sparse_id,
-              point: bool_prover.challenges.clone(),
-              eval: <F as CryptoField>::zero(),
-            };
-            claims[node.outputs[*aux_id]].push(bool_claim);
+        // Absorb `middle_claims` BEFORE squeezing challenges
+        for mc in &middle_claims {
+          for &m in mc {
+            transcript.append_scalar(b"range_middle_claim", &m);
           }
-        });
+        }
 
-        // update claims for range selector polys
-        for n in self.range.iter() {
-          let node = &self.nodes[*n];
-          let aux_id = if matches!(node.kind, BasicBlockType::NonNegative(_)) { 0 } else { 1 };
-          let inp_claim_point = claims[node.inputs[0]].last().unwrap().point.clone();
-          let auxs = &witnesses[node.outputs[aux_id]];
-          for (sparse_id, aux) in auxs.iter().enumerate() {
-            let aux_poly = aux.data.as_ref().unwrap().as_any().downcast_ref::<SparseMLPoly<F>>().unwrap();
-            let challenge_len = aux_poly.n() - inp_claim_point.len();
-            let point = inp_claim_point.iter().chain(sumcheck_prover.challenges[..challenge_len].iter()).cloned().collect::<Vec<F>>();
-            let claim = Claim {
-              edge_id: node.outputs[aux_id],
-              sparse_id: sparse_id,
-              point: point,
-              eval: <F as CryptoField>::zero(),
-            };
-            claims[node.outputs[aux_id]].push(claim);
+        let alpha: F = transcript.challenge_scalar(b"table_alpha");
+        let beta: F = transcript.challenge_scalar(b"table_beta");
+        let betas = calc_pow(beta, self.range.len());
+        let gamma: F = transcript.challenge_scalar(b"table_gamma");
+        let gammas = calc_pow(gamma, max_blocks);
+
+        let mut table_groups: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+        let mut bool_groups: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+        for (b_idx, bd) in blocks_data.iter().enumerate() {
+          table_groups.entry(bd.table_vars).or_default().push(b_idx);
+          bool_groups.entry(bd.inp_point.len() + bd.table_vars).or_default().push(b_idx);
+        }
+
+        // 1. Batched Shout table sumchecks (grouped by `table_vars`) + table evaluation claims
+        for (&table_vars, block_idxs) in &table_groups {
+          let mut batched_evals = vec![<F as CryptoField>::zero(); 1usize << table_vars];
+          for &b_idx in block_idxs {
+            let bd = &blocks_data[b_idx];
+            let bg = betas[bd.range_idx] * gammas[bd.sparse_id];
+            for (k, &v) in bd.part_evals.iter().enumerate() {
+              if v != <F as CryptoField>::zero() {
+                batched_evals[k] += bg * v;
+              }
+            }
+          }
+          let batched_aux_poly = DenseMLPoly::new(table_vars, batched_evals);
+          let range_poly = range_dense::<F>(table_vars).add_by_scalar(alpha);
+          let mut sumcheck_prover = LinearSumcheckProver::<F>::new(table_vars, 2, transcript);
+          let sumcheck_proof = sumcheck_prover.prove(&vec![batched_aux_poly, range_poly], transcript);
+          let r_tbl = &sumcheck_prover.challenges;
+          let tbl_basis = evaluate_lagrange_basis(r_tbl);
+          table_proofs.push(sumcheck_proof);
+
+          for &b_idx in block_idxs {
+            let bd = &blocks_data[b_idx];
+            let eval = bd
+              .part_evals
+              .iter()
+              .zip(tbl_basis.iter())
+              .fold(<F as CryptoField>::zero(), |acc, (&pv, &tb)| acc + pv * tb);
+            let point: Vec<F> = bd.inp_point.iter().chain(r_tbl.iter()).cloned().collect();
+            transcript.append_scalar(b"range_table_eval", &eval);
+            claims[bd.aux_edge].push(Claim {
+              edge_id: bd.aux_edge,
+              sparse_id: bd.sparse_id,
+              point,
+              eval,
+            });
+          }
+        }
+
+        // 2. Batched booleanity sumchecks (grouped by `aux_num_var`) + booleanity evaluation claims
+        for (&aux_num_var, block_idxs) in &bool_groups {
+          let mut bool_weights = Vec::with_capacity(block_idxs.len());
+          let mut bool_entries = Vec::with_capacity(block_idxs.len());
+          for &b_idx in block_idxs {
+            let bd = &blocks_data[b_idx];
+            let bg = betas[bd.range_idx] * gammas[bd.sparse_id];
+            bool_weights.push(bg * bg);
+            let aux_poly = witnesses[bd.aux_edge][bd.sparse_id]
+              .data
+              .as_ref()
+              .unwrap()
+              .as_any()
+              .downcast_ref::<SparseMLPoly<F>>()
+              .unwrap();
+            let entries: Vec<(usize, F)> = aux_poly.evaluations.iter().map(|(&idx, &val)| (idx, val)).collect();
+            bool_entries.push(entries);
+          }
+
+          let mut bool_prover = SparseBoolSumcheckProver::<F>::new(aux_num_var, transcript);
+          let eq_challenge: Vec<F> = (0..aux_num_var).map(|_| transcript.challenge_scalar(b"challenge")).collect();
+          let bool_proof = bool_prover.prove_with_entries(&bool_weights, &bool_entries, &eq_challenge, transcript);
+          bool_proofs.push(bool_proof);
+
+          for (term_idx, &b_idx) in block_idxs.iter().enumerate() {
+            let bd = &blocks_data[b_idx];
+            let eval = bool_prover.term_final_eval(term_idx);
+            transcript.append_scalar(b"range_bool_eval", &eval);
+            claims[bd.aux_edge].push(Claim {
+              edge_id: bd.aux_edge,
+              sparse_id: bd.sparse_id,
+              point: bool_prover.challenges.clone(),
+              eval,
+            });
           }
         }
       });
@@ -1385,47 +1791,157 @@ impl Dag {
     (table_proofs, middle_claims, bool_proofs)
   }
 
-  pub fn verify_two_pow<F: CryptoField + 'static>(
+  pub fn verify_two_pow<F, DP, SP>(
     &self,
-    node_proofs: &[Option<(Vec<SumcheckProof<F>>, Vec<Claim<F>>)>],
-    _witnesses: &[Vec<Witness<F>>],
+    witnesses: &[Vec<Witness<F>>],
+    edge_proofs: &[EdgeProof<F, DP, SP>],
+    claims: &mut Vec<Vec<Claim<F>>>,
     two_pow_proof: &LookupProof<F>,
     transcript: &mut Transcript<F>,
-  ) -> bool {
-    if self.two_pow.len() == 0 {
-      return true;
+  ) -> bool
+  where
+    F: CryptoField + 'static,
+    DP: MLPolyCommit<F, DenseMLPoly<F>>,
+    SP: MLPolyCommit<F, SparseMLPoly<F>>,
+  {
+    if self.two_pow.is_empty() {
+      return two_pow_proof.table_proofs.is_empty()
+        && two_pow_proof.middle_claims.is_empty()
+        && two_pow_proof.bool_proofs.is_empty();
     }
     println!("verifying two_pow");
 
     let two_pow_table_proofs = &two_pow_proof.table_proofs;
     let two_pow_middle_claims = &two_pow_proof.middle_claims;
+    let two_pow_bool_proofs = &two_pow_proof.bool_proofs;
 
+    if two_pow_table_proofs.len() != 1 || two_pow_middle_claims.len() != self.two_pow.len() {
+      return false;
+    }
+    for mc in two_pow_middle_claims {
+      if mc.len() != 1 {
+        return false;
+      }
+    }
+
+    // Absorb `two_pow_middle_claims` BEFORE squeezing challenges
+    for mc in two_pow_middle_claims {
+      transcript.append_scalar(b"two_pow_middle_claim", &mc[0]);
+    }
+
+    // `two_pow_alpha` enforces Shout's row-sum == 1 (Hamming weight 1) invariant
+    let alpha: F = transcript.challenge_scalar(b"two_pow_alpha");
     let beta: F = transcript.challenge_scalar(b"table_beta");
     let betas = calc_pow(beta, self.two_pow.len());
 
-    // Parallelize the loop: compute sum and check equalities in parallel
-    let (table_expected_sum, all_equal) = self
-      .two_pow
-      .par_iter()
-      .enumerate()
-      .map(|(i, n)| {
-        let node_claim = &node_proofs[*n].as_ref().unwrap().1;
-        let eval_to_check = node_claim[0].eval;
-        let eval_acc = two_pow_middle_claims[i][0];
-        (eval_acc * betas[i], eval_to_check == eval_acc)
-      })
-      .reduce(
-        || (<F as CryptoField>::zero(), true),
-        |(sum1, eq1), (sum2, eq2)| (sum1 + sum2, eq1 && eq2),
-      );
+    let mut table_expected_sum = <F as CryptoField>::zero();
+    for (i, &n) in self.two_pow.iter().enumerate() {
+      let out_edge = self.nodes[n].outputs[0];
+      if claims[out_edge].is_empty() {
+        return false;
+      }
+      let eval_to_check = claims[out_edge].last().unwrap().eval;
+      let mid = two_pow_middle_claims[i][0];
+      if eval_to_check != mid {
+        return false;
+      }
+      table_expected_sum += (mid + alpha) * betas[i];
+    }
 
-    if !all_equal {
+    let mut sumcheck_verifier = SumcheckVerifier::new(4, 2, transcript);
+    let (verification_result, r_tbl) =
+      sumcheck_verifier.verify(transcript, two_pow_table_proofs[0].round_messages.clone(), table_expected_sum);
+    let Some(running_sum) = verification_result else {
+      return false;
+    };
+
+    let mut batched_aux_eval = <F as CryptoField>::zero();
+    for (i, &n) in self.two_pow.iter().enumerate() {
+      let node = &self.nodes[n];
+      let aux_edge = node.inputs[0];
+      let out_edge = node.outputs[0];
+      let inp_point = &claims[out_edge].last().unwrap().point;
+      let claim_idx = claims[aux_edge].len();
+      if claim_idx >= edge_proofs[aux_edge].claims.len() {
+        return false;
+      }
+      let c = &edge_proofs[aux_edge].claims[claim_idx];
+      let expected_point: Vec<F> = inp_point.iter().chain(r_tbl.iter()).cloned().collect();
+      if c.edge_id != aux_edge || c.sparse_id != 0 || c.point != expected_point {
+        return false;
+      }
+      transcript.append_scalar(b"two_pow_table_eval", &c.eval);
+      batched_aux_eval += betas[i] * c.eval;
+      claims[aux_edge].push(c.clone());
+    }
+
+    let table_eval = alpha + evaluate_two_pow_structured(&r_tbl);
+    if running_sum != batched_aux_eval * table_eval {
+      println!("two_pow table proof terminal evaluation mismatch");
       return false;
     }
-    // verify the table proof
-    let mut sumcheck_verifier = SumcheckVerifier::new(two_pow_table_proofs[0].round_messages.len(), 2, transcript);
-    let (verification_result, _challenges) = sumcheck_verifier.verify(transcript, two_pow_table_proofs[0].round_messages.clone(), table_expected_sum);
-    verification_result.is_some()
+
+    // Verify booleanity for any standalone TwoPow selector not already covered by `self.range`
+    let mut uncovered_groups: BTreeMap<usize, Vec<(usize, NodeId)>> = BTreeMap::new();
+    for (i, &n) in self.two_pow.iter().enumerate() {
+      let aux_edge = self.nodes[n].inputs[0];
+      if witnesses[aux_edge].len() != 1 {
+        return false;
+      }
+      let covered_by_range = self.producers[aux_edge].map_or(false, |p| {
+        if !self.range.contains(&p) {
+          return false;
+        }
+        let rnode = &self.nodes[p];
+        let r_aux_id = if matches!(rnode.kind, BasicBlockType::NonNegative(_)) { 0 } else { 1 };
+        rnode.outputs.get(r_aux_id) == Some(&aux_edge) && self.range_block_table_vars(p, 1, 0) == 4
+      });
+      if !covered_by_range {
+        let aux_num_var = get_n(&witnesses[self.nodes[n].outputs[0]][0].shape) + 4;
+        uncovered_groups.entry(aux_num_var).or_default().push((i, n));
+      }
+    }
+
+    if two_pow_bool_proofs.len() != uncovered_groups.len() {
+      return false;
+    }
+    let one = <F as CryptoField>::one();
+    for (group_idx, (&aux_num_var, items)) in uncovered_groups.iter().enumerate() {
+      let mut bool_verifier = SumcheckVerifier::new(aux_num_var, 3, transcript);
+      let eq_challenge: Vec<F> = (0..aux_num_var).map(|_| transcript.challenge_scalar(b"challenge")).collect();
+      let (verification_result, r_bool) =
+        bool_verifier.verify(transcript, two_pow_bool_proofs[group_idx].round_messages.clone(), <F as CryptoField>::zero());
+      let Some(bool_running_sum) = verification_result else {
+        return false;
+      };
+
+      let mut inner_bool = <F as CryptoField>::zero();
+      for &(i, n) in items {
+        let aux_edge = self.nodes[n].inputs[0];
+        let claim_idx = claims[aux_edge].len();
+        if claim_idx >= edge_proofs[aux_edge].claims.len() {
+          return false;
+        }
+        let c = &edge_proofs[aux_edge].claims[claim_idx];
+        if c.edge_id != aux_edge || c.sparse_id != 0 || c.point != r_bool {
+          return false;
+        }
+        transcript.append_scalar(b"two_pow_bool_eval", &c.eval);
+        let w = betas[i] * betas[i];
+        inner_bool += w * c.eval * (c.eval - one);
+        claims[aux_edge].push(c.clone());
+      }
+
+      let eq_eval = eq_challenge
+        .iter()
+        .zip(r_bool.iter())
+        .fold(one, |acc, (&ec, &rb)| acc * (rb * ec + (one - rb) * (one - ec)));
+      if bool_running_sum != eq_eval * inner_bool {
+        return false;
+      }
+    }
+
+    true
   }
 
   pub fn prove_two_pow<F: CryptoField + 'static>(
@@ -1436,50 +1952,111 @@ impl Dag {
     timing: &mut TimingTree,
   ) -> (Vec<SumcheckProof<F>>, Vec<Vec<F>>, Vec<SumcheckProof<F>>) {
     let mut table_proofs = Vec::new();
-    let bool_proofs = Vec::new();
+    let mut bool_proofs = Vec::new();
     let mut middle_claims: Vec<Vec<F>> = vec![vec![]; self.two_pow.len()];
-    // prove two_pow
-    if self.two_pow.len() > 0 {
+    if !self.two_pow.is_empty() {
       println!("proving two_pow");
       timed!(timing, "prove two_pow", {
-        let beta: F = transcript.challenge_scalar(b"table_beta");
-        let betas = calc_pow(beta, self.two_pow.len());
-        let mut aux_polys = Vec::new();
-        for (i, n) in self.two_pow.iter().enumerate() {
-          let node = &self.nodes[*n];
+        let mut part_evals_list: Vec<(EdgeId, Vec<F>, Vec<F>)> = Vec::with_capacity(self.two_pow.len());
+        for (i, &n) in self.two_pow.iter().enumerate() {
+          let node = &self.nodes[n];
           let inp_claim = claims[node.outputs[0]].last().unwrap();
           let auxs = &witnesses[node.inputs[0]];
           assert!(auxs.len() == 1, "two_pow expects 1 input");
-          let aux = &auxs[0];
-          let aux_poly = aux.data.as_ref().unwrap().as_any().downcast_ref::<SparseMLPoly<F>>().unwrap();
-          // we don't need to prove boolean for two_pow as we already proved it in the range proof
-          // prove Shout
-          let part_aux_poly = aux_poly.fix_variables(&inp_claim.point);
-          middle_claims[i].push(part_aux_poly.evaluations.par_iter().map(|(idx, val)| *val * F::from((1 << (15 - idx)) as u32)).sum::<F>());
-          let part_aux_poly_beta = part_aux_poly.mul_by_scalar(betas[i]);
-          aux_polys.push(part_aux_poly_beta.to_dense());
+          let aux_poly = auxs[0].data.as_ref().unwrap().as_any().downcast_ref::<SparseMLPoly<F>>().unwrap();
+          let d = inp_claim.point.len();
+          let mask = if d == 0 { 0 } else { (1usize << d) - 1 };
+          let lagrange_basis = evaluate_lagrange_basis(&inp_claim.point);
+          let mut part_evals = vec![<F as CryptoField>::zero(); 16];
+          for (&full_idx, &val) in &aux_poly.evaluations {
+            part_evals[full_idx >> d] += val * lagrange_basis[full_idx & mask];
+          }
+          let mid = (0..16).fold(<F as CryptoField>::zero(), |acc, idx| {
+            acc + part_evals[idx] * F::from(1u32 << (15 - idx))
+          });
+          middle_claims[i].push(mid);
+          part_evals_list.push((node.inputs[0], inp_claim.point.clone(), part_evals));
         }
-        let aux_poly = aux_polys[1..aux_polys.len()].iter().fold(aux_polys[0].clone(), |acc, x| acc.add(x));
-        let two_pow_poly = two_pow_dense::<F>(aux_poly.n());
-        let mut sumcheck_prover = LinearSumcheckProver::<F>::new(two_pow_poly.n(), 2, transcript);
+
+        for mc in &middle_claims {
+          transcript.append_scalar(b"two_pow_middle_claim", &mc[0]);
+        }
+
+        let alpha: F = transcript.challenge_scalar(b"two_pow_alpha");
+        let beta: F = transcript.challenge_scalar(b"table_beta");
+        let betas = calc_pow(beta, self.two_pow.len());
+
+        let mut batched_evals = vec![<F as CryptoField>::zero(); 16];
+        for (i, (_, _, part_evals)) in part_evals_list.iter().enumerate() {
+          for k in 0..16 {
+            if part_evals[k] != <F as CryptoField>::zero() {
+              batched_evals[k] += betas[i] * part_evals[k];
+            }
+          }
+        }
+        let aux_poly = DenseMLPoly::new(4, batched_evals);
+        let two_pow_poly = two_pow_dense::<F>(4).add_by_scalar(alpha);
+        let mut sumcheck_prover = LinearSumcheckProver::<F>::new(4, 2, transcript);
         let sumcheck_proof = sumcheck_prover.prove(&vec![aux_poly, two_pow_poly], transcript);
+        let r_tbl = &sumcheck_prover.challenges;
+        let tbl_basis = evaluate_lagrange_basis(r_tbl);
         table_proofs.push(sumcheck_proof);
 
-        // update claims for two_pow selector polys
-        for n in self.two_pow.iter() {
-          let node = &self.nodes[*n];
-          let inp_claim_point = claims[node.outputs[0]].last().unwrap().point.clone();
-          let aux = &witnesses[node.inputs[0]][0];
-          let aux_poly = aux.data.as_ref().unwrap().as_any().downcast_ref::<SparseMLPoly<F>>().unwrap();
-          let challenge_len = aux_poly.n() - inp_claim_point.len();
-          let point = inp_claim_point.iter().chain(sumcheck_prover.challenges[..challenge_len].iter()).cloned().collect::<Vec<F>>();
-          let claim = Claim {
-            edge_id: node.inputs[0],
+        for (aux_edge, inp_point, part_evals) in &part_evals_list {
+          let eval = (0..16).fold(<F as CryptoField>::zero(), |acc, k| acc + part_evals[k] * tbl_basis[k]);
+          let point: Vec<F> = inp_point.iter().chain(r_tbl.iter()).cloned().collect();
+          transcript.append_scalar(b"two_pow_table_eval", &eval);
+          claims[*aux_edge].push(Claim {
+            edge_id: *aux_edge,
             sparse_id: 0,
-            point: point,
-            eval: <F as CryptoField>::zero(),
-          };
-          claims[node.inputs[0]].push(claim);
+            point,
+            eval,
+          });
+        }
+
+        // Emit booleanity proofs for standalone TwoPow selectors not already covered by `self.range`
+        let mut uncovered_groups: BTreeMap<usize, Vec<(usize, NodeId)>> = BTreeMap::new();
+        for (i, &n) in self.two_pow.iter().enumerate() {
+          let aux_edge = self.nodes[n].inputs[0];
+          let covered_by_range = self.producers[aux_edge].map_or(false, |p| {
+            if !self.range.contains(&p) || witnesses[aux_edge].len() != 1 {
+              return false;
+            }
+            let rnode = &self.nodes[p];
+            let r_aux_id = if matches!(rnode.kind, BasicBlockType::NonNegative(_)) { 0 } else { 1 };
+            rnode.outputs.get(r_aux_id) == Some(&aux_edge) && self.range_block_table_vars(p, 1, 0) == 4
+          });
+          if !covered_by_range {
+            let aux_num_var = get_n(&witnesses[self.nodes[n].outputs[0]][0].shape) + 4;
+            uncovered_groups.entry(aux_num_var).or_default().push((i, n));
+          }
+        }
+        for (&aux_num_var, items) in &uncovered_groups {
+          let mut bool_weights = Vec::with_capacity(items.len());
+          let mut bool_entries = Vec::with_capacity(items.len());
+          for &(i, n) in items {
+            bool_weights.push(betas[i] * betas[i]);
+            let aux_edge = self.nodes[n].inputs[0];
+            let aux_poly = witnesses[aux_edge][0].data.as_ref().unwrap().as_any().downcast_ref::<SparseMLPoly<F>>().unwrap();
+            let entries: Vec<(usize, F)> = aux_poly.evaluations.iter().map(|(&idx, &val)| (idx, val)).collect();
+            bool_entries.push(entries);
+          }
+          let mut bool_prover = SparseBoolSumcheckProver::<F>::new(aux_num_var, transcript);
+          let eq_challenge: Vec<F> = (0..aux_num_var).map(|_| transcript.challenge_scalar(b"challenge")).collect();
+          let bool_proof = bool_prover.prove_with_entries(&bool_weights, &bool_entries, &eq_challenge, transcript);
+          bool_proofs.push(bool_proof);
+
+          for (term_idx, &(_, n)) in items.iter().enumerate() {
+            let aux_edge = self.nodes[n].inputs[0];
+            let eval = bool_prover.term_final_eval(term_idx);
+            transcript.append_scalar(b"two_pow_bool_eval", &eval);
+            claims[aux_edge].push(Claim {
+              edge_id: aux_edge,
+              sparse_id: 0,
+              point: bool_prover.challenges.clone(),
+              eval,
+            });
+          }
         }
       });
     }
