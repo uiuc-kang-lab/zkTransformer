@@ -11,9 +11,9 @@ macro_rules! kzh3_test_suite {
     #[$cfg_attr]
     #[cfg(test)]
     mod $mod_name {
-      use zktransformer::crypto::polycommit::kzh3::{KZH3Commit, KZH3CommitKey, KZH3VerifierKey};
-      use zktransformer::crypto::polycommit::MLPolyCommit;
-      use zktransformer::util::poly::{CryptoField, DenseMLPoly};
+      use zk_torch_2::crypto::polycommit::kzh3::{KZH3Commit, KZH3CommitKey, KZH3VerifierKey};
+      use zk_torch_2::crypto::polycommit::MLPolyCommit;
+      use zk_torch_2::util::poly::{CryptoField, DenseMLPoly};
 
       // Helper to create field elements
       macro_rules! fr_from {
@@ -96,7 +96,7 @@ kzh3_test_suite!(arkworks_kzh3_tests, cfg(feature = "arkworks"), ark_bn254::Bn25
 kzh3_test_suite!(
   icicle_non_zk_kzh3_tests,
   cfg(feature = "icicle"),
-  zktransformer::crypto::polycommit::IcicleBls12_381,
+  zk_torch_2::crypto::polycommit::IcicleBls12_381,
   icicle_bls12_381::curve::ScalarField,
   true
 );
@@ -114,11 +114,11 @@ macro_rules! sparse_kzh3_test_suite {
     #[$cfg_attr]
     #[cfg(test)]
     mod $mod_name {
-      use std::collections::HashMap;
-      use zktransformer::crypto::polycommit::sparse_kzh3::{sparse_kzh3_commit, sparse_kzh3_open, sparse_kzh3_verify};
-      use zktransformer::crypto::polycommit::sparse_kzh3::{SparseKZH3Commit, SparseKZH3CommitKey, SparseKZH3VerifierKey};
-      use zktransformer::crypto::polycommit::MLPolyCommit;
-      use zktransformer::util::poly::{usize_to_le_vec, CryptoField, DenseMLPoly, MLPoly, SparseMLPoly};
+      use std::collections::{HashMap, VecDeque};
+      use zk_torch_2::crypto::polycommit::sparse_kzh3::{sparse_kzh3_commit, sparse_kzh3_open, sparse_kzh3_verify};
+      use zk_torch_2::crypto::polycommit::sparse_kzh3::{SparseKZH3Commit, SparseKZH3CommitKey, SparseKZH3VerifierKey};
+      use zk_torch_2::crypto::polycommit::MLPolyCommit;
+      use zk_torch_2::util::poly::{CryptoField, DenseMLPoly, MLPoly, SelectionPolynomial, SparseMLPoly};
 
       // Helper to create field elements
       macro_rules! fr_from {
@@ -134,17 +134,12 @@ macro_rules! sparse_kzh3_test_suite {
       /// Creates a sparse polynomial from a list of (index, value) pairs
       fn create_sparse_poly(num_vars: usize, entries: Vec<(usize, $fr)>) -> SparseMLPoly<$fr> {
         let mut evaluations = HashMap::new();
-        let mut indices = Vec::new();
-
         for (idx, val) in entries {
-          let idx_bytes = usize_to_le_vec(idx);
-          evaluations.insert(idx_bytes.clone(), val);
-          indices.push(idx_bytes);
+          evaluations.insert(idx, val);
         }
-
-        indices.sort();
-
-        SparseMLPoly::new(num_vars, evaluations, indices.into())
+        let mut poly = SparseMLPoly::new(num_vars, evaluations, VecDeque::new(), SelectionPolynomial::new(num_vars, 0, vec![]));
+        poly.build_sorted_indices();
+        poly
       }
 
       /// Test non-ZK sparse KZH3 commit/open/verify cycle
@@ -286,7 +281,7 @@ sparse_kzh3_test_suite!(
 sparse_kzh3_test_suite!(
   icicle_sparse_kzh3_tests,
   cfg(feature = "icicle"),
-  zktransformer::crypto::polycommit::IcicleBls12_381,
+  zk_torch_2::crypto::polycommit::IcicleBls12_381,
   icicle_bls12_381::curve::ScalarField,
   true
 );

@@ -12,9 +12,9 @@ macro_rules! kzh2_test_suite {
     #[$cfg_attr]
     #[cfg(test)]
     mod $mod_name {
-      use zktransformer::crypto::polycommit::kzh2::{kzh2_commit, kzh2_open, kzh2_verify, KZH2Commit, KZH2CommitKey, KZH2VerifierKey};
-      use zktransformer::crypto::polycommit::MLPolyCommit;
-      use zktransformer::util::poly::{CryptoField, DenseMLPoly, MLPoly};
+      use zk_torch_2::crypto::polycommit::kzh2::{kzh2_commit, kzh2_open, kzh2_verify, KZH2Commit, KZH2CommitKey, KZH2VerifierKey};
+      use zk_torch_2::crypto::polycommit::MLPolyCommit;
+      use zk_torch_2::util::poly::{CryptoField, DenseMLPoly, MLPoly};
 
       // Helper to create field elements - works for both arkworks and icicle
       macro_rules! fr_from {
@@ -161,7 +161,7 @@ macro_rules! kzh2_test_suite {
         let expected_eval_zero = poly.evaluate_at_point(&zero_point);
         let proof_zero = KZH2Commit::open(&commitment, &poly, &key, &zero_point);
 
-        use zktransformer::crypto::polycommit::kzh2::split_input;
+        use zk_torch_2::crypto::polycommit::kzh2::split_input;
         let srs = &commitment.srs;
         let split_input = split_input(srs, &zero_point, fr_zero!());
         let r_y = &split_input[0];
@@ -186,7 +186,7 @@ kzh2_test_suite!(arkworks_kzh2_tests, cfg(feature = "arkworks"), ark_bn254::Bn25
 kzh2_test_suite!(
   icicle_kzh2_tests,
   cfg(all(feature = "icicle", feature = "bls12_381")),
-  zktransformer::crypto::polycommit::IcicleBls12_381,
+  zk_torch_2::crypto::polycommit::IcicleBls12_381,
   icicle_bls12_381::curve::ScalarField,
   true
 );
@@ -196,7 +196,7 @@ kzh2_test_suite!(
 kzh2_test_suite!(
   icicle_bn254_kzh2_tests,
   cfg(all(feature = "icicle", feature = "bn254")),
-  zktransformer::crypto::polycommit::IcicleBn254,
+  zk_torch_2::crypto::polycommit::IcicleBn254,
   icicle_bn254::curve::ScalarField,
   true
 );
@@ -214,13 +214,13 @@ macro_rules! sparse_kzh2_test_suite {
     #[$cfg_attr]
     #[cfg(test)]
     mod $mod_name {
-      use std::collections::HashMap;
-      use zktransformer::crypto::polycommit::kzh2::kzh2_verify;
-      use zktransformer::crypto::polycommit::sparse_kzh2::{
+      use std::collections::{HashMap, VecDeque};
+      use zk_torch_2::crypto::polycommit::kzh2::kzh2_verify;
+      use zk_torch_2::crypto::polycommit::sparse_kzh2::{
         sparse_kzh2_commit, sparse_kzh2_open, SparseKZH2Commit, SparseKZH2CommitKey, SparseKZH2VerifierKey,
       };
-      use zktransformer::crypto::polycommit::MLPolyCommit;
-      use zktransformer::util::poly::{usize_to_le_vec, CryptoField, MLPoly, SparseMLPoly};
+      use zk_torch_2::crypto::polycommit::MLPolyCommit;
+      use zk_torch_2::util::poly::{CryptoField, MLPoly, SelectionPolynomial, SparseMLPoly};
 
       // Helper to create field elements
       macro_rules! fr_from {
@@ -246,17 +246,12 @@ macro_rules! sparse_kzh2_test_suite {
       /// Creates a sparse polynomial from a list of (index, value) pairs
       fn create_sparse_poly(num_vars: usize, entries: Vec<(usize, $fr)>) -> SparseMLPoly<$fr> {
         let mut evaluations = HashMap::new();
-        let mut indices = Vec::new();
-
         for (idx, val) in entries {
-          let idx_bytes = usize_to_le_vec(idx);
-          evaluations.insert(idx_bytes.clone(), val);
-          indices.push(idx_bytes);
+          evaluations.insert(idx, val);
         }
-
-        indices.sort();
-
-        SparseMLPoly::new(num_vars, evaluations, indices.into())
+        let mut poly = SparseMLPoly::new(num_vars, evaluations, VecDeque::new(), SelectionPolynomial::new(num_vars, 0, vec![]));
+        poly.build_sorted_indices();
+        poly
       }
 
       /// Test sparse KZH2 commit/open/verify cycle
@@ -369,7 +364,7 @@ macro_rules! sparse_kzh2_test_suite {
         let expected_eval_zero = poly.evaluate_at_point(&zero_point);
         let proof_zero = SparseKZH2Commit::open(&commitment, &poly, &key, &zero_point);
 
-        use zktransformer::crypto::polycommit::kzh2::split_input;
+        use zk_torch_2::crypto::polycommit::kzh2::split_input;
         let srs = &commitment.srs;
         let split_input = split_input(srs, &zero_point, fr_zero!());
         let r_y = &split_input[0];
@@ -400,7 +395,7 @@ sparse_kzh2_test_suite!(
 sparse_kzh2_test_suite!(
   icicle_bn254_sparse_kzh2_tests,
   cfg(all(feature = "icicle", feature = "bn254")),
-  zktransformer::crypto::polycommit::IcicleBn254,
+  zk_torch_2::crypto::polycommit::IcicleBn254,
   icicle_bn254::curve::ScalarField,
   true
 );

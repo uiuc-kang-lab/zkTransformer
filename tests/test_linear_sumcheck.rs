@@ -11,9 +11,9 @@ use icicle_bn254::curve::ScalarField as F;
 #[cfg(all(feature = "icicle", feature = "goldilocks"))]
 use icicle_goldilocks::field::ScalarField as F;
 
-use zktransformer::crypto::{LinearSumcheckProver, SumcheckProver, SumcheckVerifier};
-use zktransformer::util::poly::{CryptoField, DenseMLPoly};
-use zktransformer::util::transcript::Transcript;
+use zk_torch_2::crypto::{LinearSumcheckProver, SumcheckProver, SumcheckVerifier};
+use zk_torch_2::util::poly::{CryptoField, DenseMLPoly};
+use zk_torch_2::util::transcript::Transcript;
 
 #[test]
 fn test_linear_sumcheck_constant_polynomials() {

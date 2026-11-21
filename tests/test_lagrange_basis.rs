@@ -10,7 +10,7 @@ use icicle_bls12_381::curve::ScalarField as F;
 use icicle_bn254::curve::ScalarField as F;
 #[cfg(all(feature = "icicle", feature = "goldilocks"))]
 use icicle_goldilocks::field::ScalarField as F;
-use zktransformer::util::poly::{evaluate_lagrange_basis, CryptoField};
+use zk_torch_2::util::poly::{evaluate_lagrange_basis, CryptoField};
 
 #[test]
 fn test_lagrange_basis_single_variable() {
