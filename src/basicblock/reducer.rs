@@ -23,6 +23,13 @@ impl<F: CryptoField> BasicBlock<F> for Reducer {
     transcript: &mut Transcript<F>,
   ) -> (Vec<SumcheckProof<F>>, Vec<Claim<F>>) {
     assert!(witnesses.len() == 1, "Reducer expects 1 input");
+    for claim in out_claims.iter() {
+      transcript.append_u64(b"reducer_in_edge", claim.edge_id as u64);
+      for p in &claim.point {
+        transcript.append_scalar(b"reducer_in_point", p);
+      }
+      transcript.append_scalar(b"reducer_in_eval", &claim.eval);
+    }
     let alpha: F = transcript.challenge_scalar(b"reducer_alpha");
     let alphas = calc_pow(alpha, out_claims.len());
     let mut proofs = Vec::new();
@@ -61,6 +68,13 @@ impl<F: CryptoField> BasicBlock<F> for Reducer {
   fn verify(&self, witnesses: &[&Witness<F>], claims: &[&Claim<F>], sumcheck_proofs: &[&SumcheckProof<F>], transcript: &mut Transcript<F>) -> bool {
     if witnesses.len() != 1 || claims.len() < 3 || sumcheck_proofs.len() != 1 {
       return false;
+    }
+    for claim in claims[..claims.len() - 1].iter() {
+      transcript.append_u64(b"reducer_in_edge", claim.edge_id as u64);
+      for p in &claim.point {
+        transcript.append_scalar(b"reducer_in_point", p);
+      }
+      transcript.append_scalar(b"reducer_in_eval", &claim.eval);
     }
     let alpha: F = transcript.challenge_scalar(b"reducer_alpha");
     let alphas = calc_pow(alpha, claims.len() - 1);

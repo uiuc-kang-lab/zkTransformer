@@ -108,7 +108,7 @@ impl<F: CryptoField + 'static> DagBuilder<F> {
     let shape = inp_value.shape.clone();
     let sf = inp_value.sf;
     let data_type = inp_value.data_type;
-    let out_value = Witness::new_wo_data(shape, data_type, sf, Role::Output);
+    let out_value = Witness::new_wo_data(shape, data_type, sf, Role::Auxiliary);
     self.init_values.push(Some(out_value));
     self.add_gkr_node(vec![a], div_const_basicblock)
   }
@@ -168,7 +168,7 @@ impl<F: CryptoField + 'static> DagBuilder<F> {
     let data_type = inp_value.data_type;
     let dim = *shape.last().unwrap();
     let softmax_const_basicblock = BasicBlockType::SoftmaxConst(SoftmaxConst { dim });
-    let out_value = Witness::new_wo_data(shape, data_type, sf, Role::Output);
+    let out_value = Witness::new_wo_data(shape, data_type, sf, Role::Auxiliary);
     self.init_values.push(Some(out_value));
     self.add_gkr_node(vec![a], softmax_const_basicblock)
   }

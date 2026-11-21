@@ -827,3 +827,90 @@ fn test_poc_partial_block_scale_overflow_rejected() {
   );
   assert!(!verified, "Partial-block ScaleDown bit-width overflow MUST be rejected");
 }
+
+/// Regression for Cross-Family Audit Catch C1 (`ClampLower` Uncommitted Advice Decoupling):
+/// Ensures `ClampLower`'s output edge is `Role::Auxiliary`, committed under `KZH3`, and cannot
+/// be downgraded to `Role::Output` or opened to two inconsistent values across its consumers.
+#[test]
+fn test_poc_clamp_lower_advice_must_be_committed_and_bound() {
+  let mut g = DagBuilder::<F>::new();
+  let x_edge = g.input(vec![4], DataType::Float);
+  let y_edge = g.exp(x_edge)[0];
+  let (dag, mut init) = g.compile();
+
+  let x_w = Witness::new(vec![4], vec![f_i64(-2840); 4], DataType::Float, 10, Role::Input);
+  dag.run(&mut init, &[(x_edge, x_w)]);
+
+  let (ck, sck, vk, svk) = setup_keys_for_dag(&dag, &init, &[]);
+  let mut dense_comms = vec![None; dag.num_edges()];
+  let mut sparse_comms = vec![None; dag.num_edges()];
+  let mut timing = TimingTree::default();
+  dag.commit::<F, KZH3Commit<PairingType>, SparseKZH3Commit<PairingType>>(
+    &ck, &sck, &init, &mut dense_comms, &mut sparse_comms, &mut timing,
+  );
+
+  // Locate ClampLower output edge (`Role::Auxiliary` and committed)
+  let clamp_out_edge = (0..dag.num_edges())
+    .find(|&e| init[e][0].role == Role::Auxiliary && init[e][0].poly_type == zk_torch_2::dag::PolyType::Dense)
+    .expect("ClampLower output must be a Dense Auxiliary edge");
+  assert!(dense_comms[clamp_out_edge].is_some(), "ClampLower output MUST be committed");
+
+  let mut prover_transcript = Transcript::new(b"zkml");
+  let (node_proofs, edge_proofs, range_proof, two_pow_proof, reducer_proofs) =
+    dag.prove::<F, KZH3Commit<PairingType>, SparseKZH3Commit<PairingType>>(
+      &ck, &sck, &init, &dense_comms, &sparse_comms, &mut prover_transcript, &mut timing,
+    );
+  let _ = y_edge;
+
+  init.iter_mut().for_each(|w| w.iter_mut().for_each(|w| w.clear_data()));
+
+  // Attempt to flip ClampLower output role back to `Role::Output` and drop its commitment:
+  let mut tampered_init = init.clone();
+  tampered_init[clamp_out_edge][0].role = Role::Output;
+  let mut tampered_comms = dense_comms.clone();
+  tampered_comms[clamp_out_edge] = None;
+  let mut verifier_transcript = Transcript::new(b"zkml");
+  let verified = dag.verify::<F, KZH3Commit<PairingType>, SparseKZH3Commit<PairingType>>(
+    &node_proofs, &edge_proofs, &range_proof, &two_pow_proof, &reducer_proofs,
+    &tampered_init, &vk, &svk, &tampered_comms, &sparse_comms, &mut verifier_transcript,
+  );
+  assert!(!verified, "Uncommitted or Role-downgraded ClampLower output MUST be rejected");
+}
+
+/// Regression for Cross-Family Audit Catch C2 & m1 (PCS VerifierKey Provenance & Malformed `f_star`):
+/// Verifies that `KZH3Commit::verify_and_extract` uses the trusted `VerifierKey` rather than
+/// `commitment.srs` (rejecting a `fake_setup` identity SRS swapped onto a valid commitment point),
+/// and returns `false` without panicking when `proof.f_star` has mismatched dimensions.
+#[test]
+fn test_poc_pcs_untrusted_commitment_srs_and_malformed_f_star_rejected() {
+  use zk_torch_2::crypto::polycommit::MLPolyCommit;
+  let ck: KZH3CommitKey<PairingType> = KZH3Commit::setup(3, 0, 0, 0);
+  let vk = KZH3VerifierKey { srs_map: ck.srs_map.clone() };
+  let fake_ck: KZH3CommitKey<PairingType> = KZH3Commit::fake_setup(3);
+  let fake_srs = fake_ck.srs_map.get(&3).unwrap().clone();
+
+  let honest_poly = DenseMLPoly::new(3, (0..8).map(|i| f_i64(i + 1)).collect());
+  let honest_comm = KZH3Commit::commit(&honest_poly, &ck);
+
+  // Build a forged commitment preserving honest `c` (same Fiat-Shamir bytes!) with `fake_setup` SRS:
+  let forged_poly = DenseMLPoly::new(3, vec![f_i64(999); 8]);
+  let mut forged_comm_on_fake = KZH3Commit::commit(&forged_poly, &fake_ck);
+  forged_comm_on_fake.c = honest_comm.c;
+  forged_comm_on_fake.srs = fake_srs;
+
+  let point = vec![f_i64(2), f_i64(3), f_i64(5)];
+  let forged_proof = KZH3Commit::open(&forged_comm_on_fake, &forged_poly, &fake_ck, &point);
+
+  assert!(
+    !KZH3Commit::verify(&forged_comm_on_fake, &forged_proof, &vk, &point),
+    "KZH3::verify MUST use trusted VerifierKey and reject fake commitment.srs"
+  );
+  let (ok, _) = KZH3Commit::verify_and_extract(&forged_comm_on_fake, &forged_proof, &vk, &point);
+  assert!(!ok, "KZH3::verify_and_extract MUST reject fake commitment.srs");
+
+  // Also test malformed `f_star` arity/length does not panic:
+  let mut malformed_proof = KZH3Commit::open(&honest_comm, &honest_poly, &ck, &point);
+  malformed_proof.f_star = DenseMLPoly::new(0, vec![f_i64(42)]);
+  let (ok_malformed, _) = KZH3Commit::verify_and_extract(&honest_comm, &malformed_proof, &vk, &point);
+  assert!(!ok_malformed, "Malformed f_star dimension MUST return false cleanly without panicking");
+}

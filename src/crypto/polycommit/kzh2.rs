@@ -828,6 +828,9 @@ pub fn kzh2_verify<P: PairingTrait>(
 where
   P::ScalarField: CryptoField,
 {
+  if open.d_x.len() != srs.degree_x || open.f_star.evaluations.len() != srs.degree_y {
+    return false;
+  }
   let split_input = split_input(srs, input, scalar_field_zero::<P::ScalarField>());
   let r_x = &split_input[1];
   let r_y = &split_input[0];
@@ -1020,12 +1023,27 @@ where
     kzh2_open(srs, point, &commitment.c, &commitment.aux, poly)
   }
 
-  fn verify(commitment: &Self::Commitment, proof: &Self::Proof, _key: &Self::VerifierKey, point: &[P::ScalarField]) -> bool {
-    let srs = &commitment.srs;
-    let split_input = split_input(srs, point, scalar_field_zero::<P::ScalarField>());
+  fn verify(commitment: &Self::Commitment, proof: &Self::Proof, key: &Self::VerifierKey, point: &[P::ScalarField]) -> bool {
+    Self::verify_and_extract(commitment, proof, key, point).0
+  }
+
+  fn verify_and_extract(commitment: &Self::Commitment, proof: &Self::Proof, key: &Self::VerifierKey, point: &[P::ScalarField]) -> (bool, P::ScalarField) {
+    let zero = scalar_field_zero::<P::ScalarField>();
+    let Some(srs) = key.srs_map.get(&point.len()) else {
+      return (false, zero);
+    };
+    let expected_vars = (srs.degree_x.trailing_zeros() + srs.degree_y.trailing_zeros()) as usize;
+    if point.len() > expected_vars {
+      return (false, zero);
+    }
+    let split_input = split_input(srs, point, zero);
     let r_y = &split_input[0];
+    if proof.f_star.n != r_y.len() || proof.f_star.evaluations.len() != srs.degree_y {
+      return (false, zero);
+    }
     let claimed_eval = proof.f_star.evaluate_at_point(r_y);
-    kzh2_verify(srs, point, &claimed_eval, &commitment.c, proof)
+    let ok = kzh2_verify(srs, point, &claimed_eval, &commitment.c, proof);
+    (ok, claimed_eval)
   }
 
   fn batch_open(
@@ -1080,12 +1098,27 @@ where
     kzh2_open::<P>(srs, point, &commitment.c, &commitment.aux, poly)
   }
 
-  fn verify(commitment: &Self::Commitment, proof: &Self::Proof, _key: &Self::VerifierKey, point: &[P::ScalarField]) -> bool {
-    let srs = &commitment.srs;
-    let split_input = split_input(srs, point, scalar_field_zero::<P::ScalarField>());
+  fn verify(commitment: &Self::Commitment, proof: &Self::Proof, key: &Self::VerifierKey, point: &[P::ScalarField]) -> bool {
+    Self::verify_and_extract(commitment, proof, key, point).0
+  }
+
+  fn verify_and_extract(commitment: &Self::Commitment, proof: &Self::Proof, key: &Self::VerifierKey, point: &[P::ScalarField]) -> (bool, P::ScalarField) {
+    let zero = scalar_field_zero::<P::ScalarField>();
+    let Some(srs) = key.srs_map.get(&point.len()) else {
+      return (false, zero);
+    };
+    let expected_vars = (srs.degree_x.trailing_zeros() + srs.degree_y.trailing_zeros()) as usize;
+    if point.len() > expected_vars {
+      return (false, zero);
+    }
+    let split_input = split_input(srs, point, zero);
     let r_y = &split_input[0];
+    if proof.f_star.n != r_y.len() || proof.f_star.evaluations.len() != srs.degree_y {
+      return (false, zero);
+    }
     let claimed_eval = proof.f_star.evaluate_at_point(r_y);
-    kzh2_verify::<P>(srs, point, &claimed_eval, &commitment.c, proof)
+    let ok = kzh2_verify::<P>(srs, point, &claimed_eval, &commitment.c, proof);
+    (ok, claimed_eval)
   }
 
   fn batch_open(

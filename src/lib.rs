@@ -15,13 +15,13 @@ pub static CONFIG_FILE: Lazy<String> = Lazy::new(|| {
     return cfg;
   }
   let args: Vec<String> = env::args().collect();
-  if args.len() >= 2 && std::path::Path::new(&args[1]).is_file() {
+  if args.len() >= 2 && !args[1].starts_with('-') && (args[1].ends_with(".yaml") || args[1].ends_with(".yml")) {
     return args[1].clone();
   }
   if std::path::Path::new("config.yaml").is_file() {
     return "config.yaml".to_string();
   }
-  panic!("Usage: cargo run -- <config file> (or set ZKTRANSFORMER_CONFIG / provide config.yaml)");
+  panic!("Usage: cargo run -- <config.yaml> (or set ZKTRANSFORMER_CONFIG)");
 });
 
 // Define a static CONFIG that holds the loaded configuration

@@ -130,15 +130,16 @@ impl<F: CryptoField + 'static> DagBuilder<F> {
     let ln2_sf = (2.0_f64.ln() * sf_val).round() as u64;
     let c_val: u64 = 14 * ln2_sf;
 
-    // y = ClampLower(x)
+    // y = ClampLower(x) — must be Role::Auxiliary (committed) because ClampLower::verify
+    // cannot algebraically determine y from x, and Reducer on y requires a committed target.
     let clamp_bb = BasicBlockType::ClampLower(ClampLower { c: c_val });
     let y = self.add_gkr_node(vec![x], clamp_bb)[0];
-    self.init_values.push(Some(Witness::new_wo_data(shape.clone(), data_type, sf, Role::Output)));
+    self.init_values.push(Some(Witness::new_wo_data(shape.clone(), data_type, sf, Role::Auxiliary)));
 
-    // delta = y - x, range-check delta ≥ 0
+    // delta = y - x, range-check delta ≥ 0 (accommodate -1000·2^sf causal masks at both sf=10 and sf=15)
     let delta = self.sub(y, x)[0];
     let delta_flat = self.change_shape(delta, flat_shape.clone());
-    self.add_nonneg_node(delta_flat);
+    self.add_nonneg_node_with_bits(delta_flat, (*TABLE_SIZE_LOG).max(sf + 11));
 
     // u = y + C, range-check u ≥ 0
     let n_real: usize = shape.iter().product();

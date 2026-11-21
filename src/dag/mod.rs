@@ -621,7 +621,49 @@ impl Dag {
     }
   }
 
+  fn is_advice_output_edge(&self, edge_id: EdgeId) -> bool {
+    let Some(p) = self.producers[edge_id] else {
+      return false;
+    };
+    let node = &self.nodes[p];
+    match &node.kind {
+      BasicBlockType::ClampLower(_)
+      | BasicBlockType::RMSReciprocal(_)
+      | BasicBlockType::Reciprocal(_)
+      | BasicBlockType::DivConst(_)
+      | BasicBlockType::SoftmaxConst(_)
+      | BasicBlockType::SigmoidConst(_) => node.outputs.first() == Some(&edge_id),
+      _ => false,
+    }
+  }
+
+  fn is_sparse_aux_edge(&self, edge_id: EdgeId) -> bool {
+    if let Some(p) = self.producers[edge_id] {
+      let node = &self.nodes[p];
+      match &node.kind {
+        BasicBlockType::NonNegative(_) => node.outputs.first() == Some(&edge_id),
+        BasicBlockType::ScaleDown(_)
+        | BasicBlockType::ScaleUp(_)
+        | BasicBlockType::ExpHelper(_)
+        | BasicBlockType::NonStructuredExp(_) => node.outputs.get(1) == Some(&edge_id),
+        _ => false,
+      }
+    } else {
+      self.two_pow.iter().any(|&tp| self.nodes[tp].inputs.first() == Some(&edge_id))
+    }
+  }
+
+  fn must_commit_edge(&self, edge_id: EdgeId) -> bool {
+    self.producers[edge_id].is_none()
+      || self.is_advice_output_edge(edge_id)
+      || self.is_sparse_aux_edge(edge_id)
+      || self.consumers[edge_id].is_empty()
+  }
+
   fn should_commit<F: CryptoField + 'static>(&self, witness: &Witness<F>, edge_id: EdgeId) -> bool {
+    if self.must_commit_edge(edge_id) {
+      return true;
+    }
     match witness.role {
       Role::Constant | Role::Auxiliary | Role::Input => true,
       Role::Output => self.consumers[edge_id].is_empty(),
@@ -643,8 +685,8 @@ impl Dag {
     if total_bits == 0 || num_blocks <= 1 {
       total_bits
     } else {
-      let offset = sparse_id * *TABLE_COMMIT_LOG;
-      (total_bits - offset).min(*TABLE_COMMIT_LOG)
+      let offset = sparse_id.saturating_mul(*TABLE_COMMIT_LOG);
+      total_bits.saturating_sub(offset).min(*TABLE_COMMIT_LOG)
     }
   }
 
@@ -1015,6 +1057,22 @@ impl Dag {
       return false;
     }
 
+    for e in 0..self.num_edges {
+      if witnesses[e].is_empty() {
+        return false;
+      }
+      let expected_sparse = self.is_sparse_aux_edge(e);
+      if expected_sparse && witnesses[e][0].poly_type != PolyType::Sparse {
+        return false;
+      }
+      if !expected_sparse && (witnesses[e][0].poly_type != PolyType::Dense || witnesses[e].len() != 1) {
+        return false;
+      }
+      if self.is_advice_output_edge(e) && witnesses[e][0].role != Role::Auxiliary {
+        return false;
+      }
+    }
+
     let committed_edge_ids: Vec<EdgeId> = (0..self.num_edges)
       .filter(|&e| !witnesses[e].is_empty() && self.should_commit(&witnesses[e][0], e))
       .collect();
@@ -1080,6 +1138,7 @@ impl Dag {
     }
 
     let mut preserve_nodes = BTreeSet::new();
+    let mut visited_nodes = BTreeSet::new();
     let consumer_sets: Vec<BTreeSet<NodeId>> = self.consumers.iter().map(|consumers| consumers.iter().copied().collect()).collect();
 
     let start = std::time::Instant::now();
@@ -1096,6 +1155,7 @@ impl Dag {
         nodes_to_verify.insert(u);
         continue;
       }
+      visited_nodes.insert(u);
       let node = &self.nodes[u];
 
       let Some((local_sumcheck_proofs_vec, local_claims_vec)) = node_proofs[u].as_ref() else {
@@ -1201,7 +1261,7 @@ impl Dag {
     // verify the two_pow, range, and zero_check proofs
     let start = std::time::Instant::now();
     let two_pow_verified = self.verify_two_pow(witnesses, edge_proofs, &mut claims, two_pow_proof, transcript);
-    let range_verified = self.verify_range(node_proofs, witnesses, edge_proofs, &mut claims, range_proof, transcript);
+    let range_verified = self.verify_range(node_proofs, witnesses, edge_proofs, &visited_nodes, &mut claims, range_proof, transcript);
     let zero_check_verified = self.verify_zero_check(node_proofs, &claims);
     let end = start.elapsed();
     println!("time taken to verify two_pow and range: {:?}", end);
@@ -1317,6 +1377,7 @@ impl Dag {
     node_proofs: &[Option<(Vec<SumcheckProof<F>>, Vec<Claim<F>>)>],
     witnesses: &[Vec<Witness<F>>],
     edge_proofs: &[EdgeProof<F, DP, SP>],
+    visited_nodes: &BTreeSet<NodeId>,
     claims: &mut Vec<Vec<Claim<F>>>,
     range_proof: &LookupProof<F>,
     transcript: &mut Transcript<F>,
@@ -1356,6 +1417,15 @@ impl Dag {
       let aux_id = if matches!(node.kind, BasicBlockType::NonNegative(_)) { 0 } else { 1 };
       let aux_edge = node.outputs[aux_id];
       let num_blocks = witnesses[aux_edge].len();
+      let total_bits = self.range_node_total_bits(n);
+      let expected_split_blocks = if total_bits == 0 {
+        1
+      } else {
+        (total_bits + *TABLE_COMMIT_LOG - 1) / *TABLE_COMMIT_LOG
+      };
+      if num_blocks == 0 || (num_blocks != 1 && num_blocks != expected_split_blocks) {
+        return false;
+      }
       if range_middle_claims[i].len() != num_blocks {
         return false;
       }
@@ -1378,7 +1448,7 @@ impl Dag {
         {
           return false;
         }
-      } else if node_claim.len() != 2 || node_claim[0].point.len() != expected_inp_n {
+      } else if !visited_nodes.contains(&n) || node_claim.len() != 2 || node_claim[0].point.len() != expected_inp_n {
         return false;
       }
 
@@ -1416,18 +1486,26 @@ impl Dag {
       let eval_to_check = if matches!(node.kind, BasicBlockType::ScaleDown(_)) {
         let input_sf = witnesses[node.inputs[0]][0].sf;
         let output_sf = witnesses[node.outputs[0]][0].sf;
-        let rescale_factor = 1usize << (input_sf - output_sf);
-        let rescale_factor_divided_by_2 = rescale_factor / 2;
-        let rescale_factor_f = F::from(rescale_factor as u32);
-        let rescale_factor_divided_by_2_f = F::from(rescale_factor_divided_by_2 as u32);
+        let shift = input_sf - output_sf;
+        if shift >= 127 {
+          return false;
+        }
+        let rescale_factor: i128 = 1i128 << shift;
+        let rescale_factor_divided_by_2: i128 = rescale_factor / 2;
+        let rescale_factor_f = F::from(rescale_factor);
+        let rescale_factor_divided_by_2_f = F::from(rescale_factor_divided_by_2);
         node_claim[0].eval - node_claim[1].eval * rescale_factor_f + rescale_factor_divided_by_2_f
       } else if matches!(node.kind, BasicBlockType::ScaleUp(_)) {
         let input_sf = witnesses[node.inputs[0]][0].sf;
         let output_sf = witnesses[node.outputs[0]][0].sf;
-        let rescale_factor = 1usize << (output_sf - input_sf);
-        let rescale_factor_divided_by_2 = rescale_factor / 2;
-        let rescale_factor_f = F::from(rescale_factor as u32);
-        let rescale_factor_divided_by_2_f = F::from(rescale_factor_divided_by_2 as u32);
+        let shift = output_sf - input_sf;
+        if shift >= 127 {
+          return false;
+        }
+        let rescale_factor: i128 = 1i128 << shift;
+        let rescale_factor_divided_by_2: i128 = rescale_factor / 2;
+        let rescale_factor_f = F::from(rescale_factor);
+        let rescale_factor_divided_by_2_f = F::from(rescale_factor_divided_by_2);
         node_claim[0].eval * rescale_factor_f - node_claim[1].eval + rescale_factor_divided_by_2_f
       } else if matches!(node.kind, BasicBlockType::ExpHelper(_)) {
         let cache = get_cached_inverses::<F>();
@@ -1438,8 +1516,12 @@ impl Dag {
 
       let mut eval_acc = <F as CryptoField>::zero();
       for sparse_id in 0..auxs.len() {
+        let shift = sparse_id.saturating_mul(*TABLE_COMMIT_LOG);
+        if shift >= 127 {
+          return false;
+        }
         let middle_sum = range_middle_claims[i][sparse_id];
-        eval_acc += middle_sum * F::from(1u32 << (sparse_id * *TABLE_COMMIT_LOG));
+        eval_acc += middle_sum * F::from(1i128 << shift);
       }
       if eval_to_check != eval_acc {
         println!("range eval_to_check mismatch for node {n} | kind {:?} | #auxs {}", node.kind, auxs.len());
@@ -1803,7 +1885,17 @@ impl Dag {
     let mut uncovered_groups: BTreeMap<usize, Vec<(usize, NodeId)>> = BTreeMap::new();
     for (i, &n) in self.two_pow.iter().enumerate() {
       let aux_edge = self.nodes[n].inputs[0];
-      let covered_by_range = self.producers[aux_edge].map_or(false, |p| self.range.contains(&p));
+      if witnesses[aux_edge].len() != 1 {
+        return false;
+      }
+      let covered_by_range = self.producers[aux_edge].map_or(false, |p| {
+        if !self.range.contains(&p) {
+          return false;
+        }
+        let rnode = &self.nodes[p];
+        let r_aux_id = if matches!(rnode.kind, BasicBlockType::NonNegative(_)) { 0 } else { 1 };
+        rnode.outputs.get(r_aux_id) == Some(&aux_edge) && self.range_block_table_vars(p, 1, 0) == 4
+      });
       if !covered_by_range {
         let aux_num_var = get_n(&witnesses[self.nodes[n].outputs[0]][0].shape) + 4;
         uncovered_groups.entry(aux_num_var).or_default().push((i, n));
@@ -1926,7 +2018,14 @@ impl Dag {
         let mut uncovered_groups: BTreeMap<usize, Vec<(usize, NodeId)>> = BTreeMap::new();
         for (i, &n) in self.two_pow.iter().enumerate() {
           let aux_edge = self.nodes[n].inputs[0];
-          let covered_by_range = self.producers[aux_edge].map_or(false, |p| self.range.contains(&p));
+          let covered_by_range = self.producers[aux_edge].map_or(false, |p| {
+            if !self.range.contains(&p) || witnesses[aux_edge].len() != 1 {
+              return false;
+            }
+            let rnode = &self.nodes[p];
+            let r_aux_id = if matches!(rnode.kind, BasicBlockType::NonNegative(_)) { 0 } else { 1 };
+            rnode.outputs.get(r_aux_id) == Some(&aux_edge) && self.range_block_table_vars(p, 1, 0) == 4
+          });
           if !covered_by_range {
             let aux_num_var = get_n(&witnesses[self.nodes[n].outputs[0]][0].shape) + 4;
             uncovered_groups.entry(aux_num_var).or_default().push((i, n));

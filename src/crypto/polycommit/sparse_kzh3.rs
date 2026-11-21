@@ -411,18 +411,24 @@ where
     sparse_kzh3_open(srs, point, &commitment.c, &commitment.aux, poly)
   }
 
-  fn verify(commitment: &Self::Commitment, proof: &Self::Proof, _key: &Self::VerifierKey, point: &[P::ScalarField]) -> bool {
-    let srs = &commitment.srs;
-    let split_input = split_input(srs, point, scalar_field_zero::<P::ScalarField>());
-    let r_z = &split_input[0];
-    let claimed_eval = proof.f_star.evaluate_at_point(r_z);
-    kzh3_verify(srs, point, &claimed_eval, &commitment.c, proof)
+  fn verify(commitment: &Self::Commitment, proof: &Self::Proof, key: &Self::VerifierKey, point: &[P::ScalarField]) -> bool {
+    Self::verify_and_extract(commitment, proof, key, point).0
   }
 
-  fn verify_and_extract(commitment: &Self::Commitment, proof: &Self::Proof, _key: &Self::VerifierKey, point: &[P::ScalarField]) -> (bool, P::ScalarField) {
-    let srs = &commitment.srs;
-    let split_input = split_input(srs, point, scalar_field_zero::<P::ScalarField>());
+  fn verify_and_extract(commitment: &Self::Commitment, proof: &Self::Proof, key: &Self::VerifierKey, point: &[P::ScalarField]) -> (bool, P::ScalarField) {
+    let zero = scalar_field_zero::<P::ScalarField>();
+    let Some(srs) = key.srs_map.get(&point.len()) else {
+      return (false, zero);
+    };
+    let expected_vars = (srs.degree_x.trailing_zeros() + srs.degree_y.trailing_zeros() + srs.degree_z.trailing_zeros()) as usize;
+    if point.len() > expected_vars {
+      return (false, zero);
+    }
+    let split_input = split_input(srs, point, zero);
     let r_z = &split_input[0];
+    if proof.f_star.n != r_z.len() || proof.f_star.evaluations.len() != srs.degree_z {
+      return (false, zero);
+    }
     let claimed_eval = proof.f_star.evaluate_at_point(r_z);
     let ok = kzh3_verify(srs, point, &claimed_eval, &commitment.c, proof);
     (ok, claimed_eval)
@@ -480,18 +486,24 @@ where
     sparse_kzh3_open(srs, point, &commitment.c, &commitment.aux, poly)
   }
 
-  fn verify(commitment: &Self::Commitment, proof: &Self::Proof, _key: &Self::VerifierKey, point: &[P::ScalarField]) -> bool {
-    let srs = &commitment.srs;
-    let split_input = split_input(srs, point, scalar_field_zero::<P::ScalarField>());
-    let r_z = &split_input[0];
-    let claimed_eval = proof.f_star.evaluate_at_point(r_z);
-    kzh3_verify(srs, point, &claimed_eval, &commitment.c, proof)
+  fn verify(commitment: &Self::Commitment, proof: &Self::Proof, key: &Self::VerifierKey, point: &[P::ScalarField]) -> bool {
+    Self::verify_and_extract(commitment, proof, key, point).0
   }
 
-  fn verify_and_extract(commitment: &Self::Commitment, proof: &Self::Proof, _key: &Self::VerifierKey, point: &[P::ScalarField]) -> (bool, P::ScalarField) {
-    let srs = &commitment.srs;
-    let split_input = split_input(srs, point, scalar_field_zero::<P::ScalarField>());
+  fn verify_and_extract(commitment: &Self::Commitment, proof: &Self::Proof, key: &Self::VerifierKey, point: &[P::ScalarField]) -> (bool, P::ScalarField) {
+    let zero = scalar_field_zero::<P::ScalarField>();
+    let Some(srs) = key.srs_map.get(&point.len()) else {
+      return (false, zero);
+    };
+    let expected_vars = (srs.degree_x.trailing_zeros() + srs.degree_y.trailing_zeros() + srs.degree_z.trailing_zeros()) as usize;
+    if point.len() > expected_vars {
+      return (false, zero);
+    }
+    let split_input = split_input(srs, point, zero);
     let r_z = &split_input[0];
+    if proof.f_star.n != r_z.len() || proof.f_star.evaluations.len() != srs.degree_z {
+      return (false, zero);
+    }
     let claimed_eval = proof.f_star.evaluate_at_point(r_z);
     let ok = kzh3_verify(srs, point, &claimed_eval, &commitment.c, proof);
     (ok, claimed_eval)

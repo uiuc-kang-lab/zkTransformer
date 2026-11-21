@@ -109,17 +109,14 @@ impl<F: CryptoField> BasicBlock<F> for NonStructuredExp {
     let num_var = get_n(&x_shape);
 
     let ln2 = (2.0_f64.ln() * (*SF_FLOAT as f64)).round();
-    let neg_ln2_f = <F as CryptoField>::zero() - F::from(ln2 as u32);
 
     let table_size = 1usize << 10;
-    let mut r_data = vec![<F as CryptoField>::zero(); n];
+    let mut y_data = vec![<F as CryptoField>::zero(); n];
     let mut selection = Vec::new();
     for i in 0..n {
       let x_i = x.data.as_ref().unwrap().index(i);
       let x_i_num = f_to_int(x_i) as f64;
       let k = ((-x_i_num) / ln2).round();
-
-      r_data[i] = x_i - (F::from(k as u32) * neg_ln2_f);
 
       let k_idx = k as i64;
       let table_index = if k_idx >= 0 && (k_idx as usize) < table_size {
@@ -127,10 +124,11 @@ impl<F: CryptoField> BasicBlock<F> for NonStructuredExp {
       } else {
         0
       };
+      y_data[i] = inputs[1].data.as_ref().unwrap().index(table_index);
       selection.push((i, table_index));
     }
     let selection_polynomial = SelectionPolynomial::new(num_var, 10, selection);
-    let r = Witness::new(inputs[0].shape.clone(), r_data, DataType::Float, *SF_LOG, Role::Output);
+    let y = Witness::new(inputs[0].shape.clone(), y_data, DataType::Float, *SF_LOG, Role::Output);
     let aux = Witness {
       shape: inputs[0].shape.clone(),
       data: Some(Box::new(selection_polynomial.to_sparse()) as Box<dyn crate::util::poly::MLPoly<F>>),
@@ -141,7 +139,7 @@ impl<F: CryptoField> BasicBlock<F> for NonStructuredExp {
       role: Role::Auxiliary,
       is_permuted_with: None,
     };
-    vec![r, aux]
+    vec![y, aux]
   }
 
   fn prove(
